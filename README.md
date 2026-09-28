@@ -1,7 +1,7 @@
 # Pegboards
 
 A ClickUp-style Kanban app with time tracking and custom metric dashboards.
-Built with Next.js (Pages Router), Tailwind CSS and SQLite.
+Built with Next.js (Pages Router), Tailwind CSS and MongoDB.
 
 ## Features
 
@@ -33,29 +33,38 @@ Group by person, board, status, priority, day, week or month. Filter by date ran
 
 ## Getting started
 
-Requires **Node.js 22.16 or newer** (uses the built-in `node:sqlite` module, so there is
-no native database driver to install).
+Requires **Node.js 20.19 or newer** and a MongoDB database (a free
+[MongoDB Atlas](https://www.mongodb.com/atlas) cluster works).
 
-```bash
-npm install
-npm run dev
-```
+1. Copy `.env.example` to `.env.local` (or `.env`) and set `MONGODB_URI`.
+2. Install and run:
 
-Open http://localhost:3000. On first run you'll be sent to `/setup` to create the admin
-account. Tick "Add sample boards…" to load demo data. The sample teammates sign in with
-password `demo1234`.
+   ```bash
+   npm install
+   npm run dev
+   ```
+
+3. Open http://localhost:3000. On first run you'll be sent to `/setup` to create the admin
+   account. Tick "Add sample boards…" to load demo data. The sample teammates sign in with
+   password `demo1234`.
+
+Collections and indexes are created automatically on first connection.
 
 ## Configuration
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `DATABASE_PATH` | `./data/pegboards.db` | Location of the SQLite file. |
+| `MONGODB_URI` | (required) | MongoDB connection string. |
+| `MONGODB_DB` | `pegboards` | Database name inside the cluster. |
 
-The schema is created automatically on startup. Node prints an `ExperimentalWarning` for
-SQLite once per process; this is expected.
+## Deploying to Vercel
 
-**Tip:** if this folder lives in OneDrive or Dropbox, point `DATABASE_PATH` somewhere
-outside it. Sync clients can lock or corrupt a SQLite file while it's in use.
+1. In the Vercel project, go to **Settings → Environment Variables** and add `MONGODB_URI`
+   (and `MONGODB_DB` if you use a different name). `.env` files are not uploaded.
+2. In MongoDB Atlas, go to **Network Access** and allow `0.0.0.0/0`. Vercel's servers don't
+   have fixed IP addresses. Alternatively, use Vercel's MongoDB Atlas integration, which sets
+   this up for you.
+3. Redeploy.
 
 ## Project layout
 

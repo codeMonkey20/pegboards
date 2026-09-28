@@ -4,27 +4,27 @@ import { deleteTask, getTaskDetail, getTaskSummary, parseTaskInput, updateTask }
 import * as validate from '@/server/validation';
 
 export default apiHandler({
-    GET(req, res) {
-        requireUser(req);
-        res.status(200).json(getTaskDetail(parseId(req.query.id)));
+    async GET(req, res) {
+        await requireUser(req);
+        res.status(200).json(await getTaskDetail(parseId(req.query.id)));
     },
 
-    PATCH(req, res) {
-        requireUser(req);
+    async PATCH(req, res) {
+        await requireUser(req);
 
         const id = parseId(req.query.id);
 
-        updateTask(id, parseTaskInput(validate.body(req)));
-        res.status(200).json(getTaskDetail(id));
+        await updateTask(id, await parseTaskInput(validate.body(req)));
+        res.status(200).json(await getTaskDetail(id));
     },
 
-    DELETE(req, res) {
-        requireUser(req);
+    async DELETE(req, res) {
+        await requireUser(req);
 
         const id = parseId(req.query.id);
 
-        getTaskSummary(id);
-        deleteTask(id);
+        await getTaskSummary(id);
+        await deleteTask(id);
         res.status(200).json({ ok: true });
     },
 });

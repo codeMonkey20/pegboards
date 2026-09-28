@@ -6,19 +6,19 @@ import { validateWidgetConfig } from '@/server/metrics';
 import * as validate from '@/server/validation';
 
 export default apiHandler({
-    POST(req, res) {
-        const user = requireUser(req);
+    async POST(req, res) {
+        const user = await requireUser(req);
         const dashboardId = parseId(req.query.id);
         const data = validate.body(req);
 
-        requireEditableDashboard(dashboardId, user);
+        await requireEditableDashboard(dashboardId, user);
 
-        const widgetId = createWidget(dashboardId, {
+        const widgetId = await createWidget(dashboardId, {
             title: validate.string(data.title, 'Title', { min: 1, max: 100 }),
             width: validate.oneOf(data.width, 'Width', WIDGET_WIDTH_VALUES),
             config: validateWidgetConfig(data.config),
         });
 
-        res.status(201).json(getWidget(widgetId, user.id));
+        res.status(201).json(await getWidget(widgetId, user.id));
     },
 });

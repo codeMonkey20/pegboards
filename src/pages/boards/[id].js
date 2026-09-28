@@ -68,23 +68,23 @@ export default function BoardPage(props) {
     return <BoardView key={props.project.id} {...props} />;
 }
 
-export const getServerSideProps = withPageAuth(({ context }) => {
+export const getServerSideProps = withPageAuth(async ({ context }) => {
     const id = Number(context.params.id);
-    const project = Number.isInteger(id) ? getProject(id) : null;
+    const project = Number.isInteger(id) ? await getProject(id) : null;
 
     if (!project) {
         return { notFound: true };
     }
 
-    const tasks = listBoardTasks(id);
+    const tasks = await listBoardTasks(id);
     const requestedTaskId = Number(context.query.task);
 
     return {
         props: {
             project,
-            statuses: listStatuses(id),
+            statuses: await listStatuses(id),
             tasks,
-            users: listUsers(),
+            users: await listUsers(),
             openTaskId: tasks.some((task) => task.id === requestedTaskId) ? requestedTaskId : null,
         },
     };

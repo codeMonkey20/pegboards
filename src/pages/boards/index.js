@@ -128,6 +128,6 @@ export default function BoardsPage({ projects, currentUser, nav }) {
     );
 }
 
-export const getServerSideProps = withPageAuth(() => ({
-    props: { projects: listProjects() },
+export const getServerSideProps = withPageAuth(async () => ({
+    props: { projects: await listProjects() },
 }));

@@ -110,6 +110,6 @@ export default function DashboardsPage({ dashboards, currentUser, nav }) {
     );
 }
 
-export const getServerSideProps = withPageAuth(({ user }) => ({
-    props: { dashboards: listDashboards(user.id) },
+export const getServerSideProps = withPageAuth(async ({ user }) => ({
+    props: { dashboards: await listDashboards(user.id) },
 }));

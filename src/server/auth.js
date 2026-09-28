@@ -1,6 +1,6 @@
 import crypto from 'node:crypto';
 
-import { getDb } from './db';
+import { collection } from './db';
 import { HttpError } from './http';
 
 const SESSION_COOKIE = 'pegboards_session';
@@ -87,15 +87,13 @@ function serializeCookie(name, value, maxAgeSeconds) {
  *
  * @param {import('http').ServerResponse} res
  * @param {number} userId
- * @returns {void}
+ * @returns {Promise<void>}
  */
-export function startSession(res, userId) {
+export async function startSession(res, userId) {
     const token = crypto.randomBytes(32).toString('hex');
-    const expires = new Date(Date.now() + SESSION_DAYS * 24 * 60 * 60 * 1000);
+    const expiresAt = new Date(Date.now() + SESSION_DAYS * 24 * 60 * 60 * 1000);
 
-    getDb()
-        .prepare('INSERT INTO sessions (token_hash, user_id, expires_at) VALUES (?, ?, ?)')
-        .run(hashToken(token), userId, expires.toISOString());
+    await (await collection('sessions')).insertOne({ _id: hashToken(token), userId, expiresAt });
 
     res.setHeader('Set-Cookie', serializeCookie(SESSION_COOKIE, token, SESSION_DAYS * 24 * 60 * 60));
 }
@@ -105,13 +103,13 @@ export function startSession(res, userId) {
  *
  * @param {import('next').NextApiRequest} req
  * @param {import('next').NextApiResponse} res
- * @returns {void}
+ * @returns {Promise<void>}
  */
-export function endSession(req, res) {
+export async function endSession(req, res) {
     const token = req.cookies?.[SESSION_COOKIE];
 
     if (token) {
-        getDb().prepare('DELETE FROM sessions WHERE token_hash = ?').run(hashToken(token));
+        await (await collection('sessions')).deleteOne({ _id: hashToken(token) });
     }
 
     res.setHeader('Set-Cookie', serializeCookie(SESSION_COOKIE, '', 0));
@@ -121,25 +119,31 @@ export function endSession(req, res) {
  * Resolves the signed-in user from the request's session cookie.
  *
  * @param {{ cookies?: Partial<Record<string, string>> }} req
- * @returns {SessionUser|null}
+ * @returns {Promise<SessionUser|null>}
  */
-export function getSessionUser(req) {
+export async function getSessionUser(req) {
     const token = req.cookies?.[SESSION_COOKIE];
 
     if (!token || !/^[0-9a-f]{64}$/.test(token)) {
         return null;
     }
 
-    const user = getDb()
-        .prepare(
-            `SELECT u.id, u.name, u.email, u.role, u.color
-             FROM sessions s
-             JOIN users u ON u.id = s.user_id
-             WHERE s.token_hash = ? AND s.expires_at > ? AND u.is_active = 1`
-        )
-        .get(hashToken(token), new Date().toISOString());
+    // Checked here too: the TTL cleanup runs only about once a minute.
+    const session = await (await collection('sessions')).findOne({
+        _id: hashToken(token),
+        expiresAt: { $gt: new Date() },
+    });
 
-    return user ? { ...user } : null;
+    if (!session) {
+        return null;
+    }
+
+    const user = await (await collection('users')).findOne(
+        { _id: session.userId, isActive: true },
+        { projection: { name: 1, email: 1, role: 1, color: 1 } }
+    );
+
+    return user ? { id: user._id, name: user.name, email: user.email, role: user.role, color: user.color } : null;
 }
 
 /**
@@ -148,10 +152,10 @@ export function getSessionUser(req) {
  * @param {import('next').NextApiRequest} req
  * @param {Object} [options]
  * @param {boolean} [options.admin=false] - Also require the admin role.
- * @returns {SessionUser}
+ * @returns {Promise<SessionUser>}
  */
-export function requireUser(req, { admin = false } = {}) {
-    const user = getSessionUser(req);
+export async function requireUser(req, { admin = false } = {}) {
+    const user = await getSessionUser(req);
 
     if (!user) {
         throw new HttpError(401, 'Please sign in');
@@ -167,10 +171,8 @@ export function requireUser(req, { admin = false } = {}) {
 /**
  * True when no accounts exist yet, so the first visitor can create the admin.
  *
- * @returns {boolean}
+ * @returns {Promise<boolean>}
  */
-export function needsSetup() {
-    const row = getDb().prepare('SELECT COUNT(*) AS count FROM users').get();
-
-    return row.count === 0;
+export async function needsSetup() {
+    return (await (await collection('users')).countDocuments({}, { limit: 1 })) === 0;
 }

@@ -5,10 +5,10 @@ import { createProject } from '@/server/projects';
 import * as validate from '@/server/validation';
 
 export default apiHandler({
-    POST(req, res) {
-        const user = requireUser(req);
+    async POST(req, res) {
+        const user = await requireUser(req);
         const data = validate.body(req);
-        const id = createProject({
+        const id = await createProject({
             name: validate.string(data.name, 'Name', { min: 1, max: 100 }),
             description: validate.string(data.description ?? '', 'Description', { max: 1000 }),
             color: validate.color(data.color ?? COLORS[0], 'Color'),

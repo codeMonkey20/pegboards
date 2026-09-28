@@ -1,6 +1,6 @@
 import { DEFAULT_STATUSES } from '@/lib/constants';
 
-import { getDb, transaction } from './db';
+import { collection, insertWithId, nextId, setPositions } from './db';
 import { HttpError } from './http';
 
 /**
@@ -21,65 +21,76 @@ import { HttpError } from './http';
  * @property {boolean} isDone
  */
 
+const BY_NAME = { locale: 'en', strength: 2 };
+
 /**
- * @param {Object} row
+ * @param {Object} doc
+ * @returns {Project}
+ */
+function toProject(doc) {
+    return { id: doc._id, name: doc.name, description: doc.description, color: doc.color };
+}
+
+/**
+ * @param {Object} doc
  * @returns {Status}
  */
-function toStatus(row) {
+function toStatus(doc) {
     return {
-        id: row.id,
-        projectId: row.project_id,
-        name: row.name,
-        color: row.color,
-        position: row.position,
-        isDone: row.is_done === 1,
+        id: doc._id,
+        projectId: doc.projectId,
+        name: doc.name,
+        color: doc.color,
+        position: doc.position,
+        isDone: doc.isDone,
     };
 }
 
 /**
  * Lists boards with task counts for the boards overview.
  *
- * @returns {(Project & { taskCount: number, openCount: number })[]}
+ * @returns {Promise<(Project & { taskCount: number, openCount: number })[]>}
  */
-export function listProjects() {
-    const rows = getDb()
-        .prepare(
-            `SELECT p.id, p.name, p.description, p.color,
-                    COUNT(t.id) AS task_count,
-                    COALESCE(SUM(CASE WHEN t.completed_at IS NULL THEN 1 ELSE 0 END), 0) AS open_count
-             FROM projects p
-             LEFT JOIN tasks t ON t.project_id = p.id
-             GROUP BY p.id
-             ORDER BY p.name COLLATE NOCASE`
-        )
-        .all();
+export async function listProjects() {
+    const [projects, counts] = await Promise.all([
+        (await collection('projects')).find().collation(BY_NAME).sort({ name: 1 }).toArray(),
+        (await collection('tasks'))
+            .aggregate([
+                {
+                    $group: {
+                        _id: '$projectId',
+                        taskCount: { $sum: 1 },
+                        openCount: { $sum: { $cond: [{ $eq: ['$completedAt', null] }, 1, 0] } },
+                    },
+                },
+            ])
+            .toArray(),
+    ]);
+    const countsById = new Map(counts.map((count) => [count._id, count]));
 
-    return rows.map((row) => ({
-        id: row.id,
-        name: row.name,
-        description: row.description,
-        color: row.color,
-        taskCount: row.task_count,
-        openCount: row.open_count,
+    return projects.map((doc) => ({
+        ...toProject(doc),
+        taskCount: countsById.get(doc._id)?.taskCount ?? 0,
+        openCount: countsById.get(doc._id)?.openCount ?? 0,
     }));
 }
 
 /**
  * @param {number} id
- * @returns {Project|null}
+ * @returns {Promise<Project|null>}
  */
-export function getProject(id) {
-    const row = getDb().prepare('SELECT id, name, description, color FROM projects WHERE id = ?').get(id);
+export async function getProject(id) {
+    const doc = await (await collection('projects')).findOne({ _id: id });
 
-    return row ? { ...row } : null;
+    return doc ? toProject(doc) : null;
 }
 
 /**
  * @param {number} id
- * @returns {Project}
+ * @returns {Promise<Project>}
  */
-export function requireProject(id) {
-    const project = getProject(id);
+export async function requireProject(id) {
+    const project = await getProject(id);
 
     if (!project) {
         throw new HttpError(404, 'Board not found');
@@ -96,45 +107,44 @@ export function requireProject(id) {
  * @param {string} data.description
  * @param {string} data.color
  * @param {number} data.createdBy
- * @returns {number} The new board's id.
+ * @returns {Promise<number>} The new board's id.
  */
-export function createProject({ name, description, color, createdBy }) {
-    return transaction(() => {
-        const db = getDb();
-        const result = db
-            .prepare('INSERT INTO projects (name, description, color, created_by) VALUES (?, ?, ?, ?)')
-            .run(name, description, color, createdBy);
-        const projectId = Number(result.lastInsertRowid);
-        const insertStatus = db.prepare(
-            'INSERT INTO statuses (project_id, name, color, position, is_done) VALUES (?, ?, ?, ?, ?)'
-        );
+export async function createProject({ name, description, color, createdBy }) {
+    const projectId = await insertWithId('projects', { name, description, color, createdBy, createdAt: new Date() });
+    const statusDocs = [];
 
-        DEFAULT_STATUSES.forEach((status, index) => {
-            insertStatus.run(projectId, status.name, status.color, index, status.isDone ? 1 : 0);
+    for (const [position, status] of DEFAULT_STATUSES.entries()) {
+        statusDocs.push({
+            _id: await nextId('statuses'),
+            projectId,
+            name: status.name,
+            color: status.color,
+            position,
+            isDone: status.isDone,
         });
+    }
 
-        return projectId;
-    });
+    await (await collection('statuses')).insertMany(statusDocs);
+
+    return projectId;
 }
 
 /**
  * @param {number} id
  * @param {{ name?: string, description?: string, color?: string }} changes
- * @returns {void}
+ * @returns {Promise<void>}
  */
-export function updateProject(id, changes) {
-    const columns = [];
-    const values = [];
+export async function updateProject(id, changes) {
+    const update = {};
 
     for (const key of ['name', 'description', 'color']) {
         if (changes[key] !== undefined) {
-            columns.push(`${key} = ?`);
-            values.push(changes[key]);
+            update[key] = changes[key];
         }
     }
 
-    if (columns.length > 0) {
-        getDb().prepare(`UPDATE projects SET ${columns.join(', ')} WHERE id = ?`).run(...values, id);
+    if (Object.keys(update).length > 0) {
+        await (await collection('projects')).updateOne({ _id: id }, { $set: update });
     }
 }
 
@@ -142,35 +152,43 @@ export function updateProject(id, changes) {
  * Deletes a board and everything on it.
  *
  * @param {number} id
- * @returns {void}
+ * @returns {Promise<void>}
  */
-export function deleteProject(id) {
-    getDb().prepare('DELETE FROM projects WHERE id = ?').run(id);
+export async function deleteProject(id) {
+    const tasks = await collection('tasks');
+    const taskIds = await tasks.distinct('_id', { projectId: id });
+
+    await Promise.all([
+        (await collection('timeEntries')).deleteMany({ taskId: { $in: taskIds } }),
+        (await collection('comments')).deleteMany({ taskId: { $in: taskIds } }),
+    ]);
+    await tasks.deleteMany({ projectId: id });
+    await (await collection('statuses')).deleteMany({ projectId: id });
+    await (await collection('projects')).deleteOne({ _id: id });
 }
 
 /**
  * @param {number} projectId
- * @returns {Status[]}
+ * @returns {Promise<Status[]>}
  */
-export function listStatuses(projectId) {
-    return getDb()
-        .prepare('SELECT * FROM statuses WHERE project_id = ? ORDER BY position, id')
-        .all(projectId)
-        .map(toStatus);
+export async function listStatuses(projectId) {
+    const docs = await (await collection('statuses')).find({ projectId }).sort({ position: 1, _id: 1 }).toArray();
+
+    return docs.map(toStatus);
 }
 
 /**
  * @param {number} id
- * @returns {Status}
+ * @returns {Promise<Status>}
  */
-export function requireStatus(id) {
-    const row = getDb().prepare('SELECT * FROM statuses WHERE id = ?').get(id);
+export async function requireStatus(id) {
+    const doc = await (await collection('statuses')).findOne({ _id: id });
 
-    if (!row) {
+    if (!doc) {
         throw new HttpError(404, 'Column not found');
     }
 
-    return toStatus(row);
+    return toStatus(doc);
 }
 
 /**
@@ -178,18 +196,19 @@ export function requireStatus(id) {
  *
  * @param {number} projectId
  * @param {{ name: string, color: string, isDone: boolean }} data
- * @returns {Status}
+ * @returns {Promise<Status>}
  */
-export function createStatus(projectId, { name, color, isDone }) {
-    const db = getDb();
-    const { next } = db
-        .prepare('SELECT COALESCE(MAX(position), -1) + 1 AS next FROM statuses WHERE project_id = ?')
-        .get(projectId);
-    const result = db
-        .prepare('INSERT INTO statuses (project_id, name, color, position, is_done) VALUES (?, ?, ?, ?, ?)')
-        .run(projectId, name, color, next, isDone ? 1 : 0);
+export async function createStatus(projectId, { name, color, isDone }) {
+    const last = await (await collection('statuses')).findOne({ projectId }, { sort: { position: -1 } });
+    const id = await insertWithId('statuses', {
+        projectId,
+        name,
+        color,
+        position: last ? last.position + 1 : 0,
+        isDone,
+    });
 
-    return requireStatus(Number(result.lastInsertRowid));
+    return requireStatus(id);
 }
 
 /**
@@ -198,35 +217,33 @@ export function createStatus(projectId, { name, color, isDone }) {
  *
  * @param {number} id
  * @param {{ name?: string, color?: string, isDone?: boolean }} changes
- * @returns {Status}
+ * @returns {Promise<Status>}
  */
-export function updateStatus(id, changes) {
-    return transaction(() => {
-        const db = getDb();
-        const current = requireStatus(id);
+export async function updateStatus(id, changes) {
+    const current = await requireStatus(id);
+    const update = {};
 
-        if (changes.name !== undefined || changes.color !== undefined) {
-            db.prepare('UPDATE statuses SET name = ?, color = ? WHERE id = ?').run(
-                changes.name ?? current.name,
-                changes.color ?? current.color,
-                id
-            );
+    for (const key of ['name', 'color', 'isDone']) {
+        if (changes[key] !== undefined) {
+            update[key] = changes[key];
         }
+    }
 
-        if (changes.isDone !== undefined && changes.isDone !== current.isDone) {
-            db.prepare('UPDATE statuses SET is_done = ? WHERE id = ?').run(changes.isDone ? 1 : 0, id);
+    if (Object.keys(update).length > 0) {
+        await (await collection('statuses')).updateOne({ _id: id }, { $set: update });
+    }
 
-            if (changes.isDone) {
-                db.prepare(
-                    "UPDATE tasks SET completed_at = datetime('now') WHERE status_id = ? AND completed_at IS NULL"
-                ).run(id);
-            } else {
-                db.prepare('UPDATE tasks SET completed_at = NULL WHERE status_id = ?').run(id);
-            }
+    if (changes.isDone !== undefined && changes.isDone !== current.isDone) {
+        const tasks = await collection('tasks');
+
+        if (changes.isDone) {
+            await tasks.updateMany({ statusId: id, completedAt: null }, { $set: { completedAt: new Date() } });
+        } else {
+            await tasks.updateMany({ statusId: id }, { $set: { completedAt: null } });
         }
+    }
 
-        return requireStatus(id);
-    });
+    return requireStatus(id);
 }
 
 /**
@@ -234,39 +251,34 @@ export function updateStatus(id, changes) {
  *
  * @param {number} id
  * @param {-1|1} direction
- * @returns {Status[]} The board's columns in their new order.
+ * @returns {Promise<Status[]>} The board's columns in their new order.
  */
-export function moveStatus(id, direction) {
-    return transaction(() => {
-        const status = requireStatus(id);
-        const statuses = listStatuses(status.projectId);
-        const index = statuses.findIndex((item) => item.id === id);
-        const target = index + direction;
+export async function moveStatus(id, direction) {
+    const status = await requireStatus(id);
+    const ids = (await listStatuses(status.projectId)).map((item) => item.id);
+    const index = ids.indexOf(id);
+    const target = index + direction;
 
-        if (target >= 0 && target < statuses.length) {
-            [statuses[index], statuses[target]] = [statuses[target], statuses[index]];
+    if (target >= 0 && target < ids.length) {
+        [ids[index], ids[target]] = [ids[target], ids[index]];
+        await setPositions('statuses', ids);
+    }
 
-            const update = getDb().prepare('UPDATE statuses SET position = ? WHERE id = ?');
-            statuses.forEach((item, position) => update.run(position, item.id));
-        }
-
-        return listStatuses(status.projectId);
-    });
+    return listStatuses(status.projectId);
 }
 
 /**
  * Deletes an empty column.
  *
  * @param {number} id
- * @returns {void}
+ * @returns {Promise<void>}
  */
-export function deleteStatus(id) {
-    const db = getDb();
-    const status = requireStatus(id);
-    const { taskCount } = db.prepare('SELECT COUNT(*) AS taskCount FROM tasks WHERE status_id = ?').get(id);
-    const { statusCount } = db
-        .prepare('SELECT COUNT(*) AS statusCount FROM statuses WHERE project_id = ?')
-        .get(status.projectId);
+export async function deleteStatus(id) {
+    const status = await requireStatus(id);
+    const [taskCount, statusCount] = await Promise.all([
+        (await collection('tasks')).countDocuments({ statusId: id }),
+        (await collection('statuses')).countDocuments({ projectId: status.projectId }),
+    ]);
 
     if (taskCount > 0) {
         throw new HttpError(400, 'Move or delete the tasks in this column first');
@@ -276,5 +288,5 @@ export function deleteStatus(id) {
         throw new HttpError(400, 'A board needs at least one column');
     }
 
-    db.prepare('DELETE FROM statuses WHERE id = ?').run(id);
+    await (await collection('statuses')).deleteOne({ _id: id });
 }

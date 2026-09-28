@@ -1,7 +1,7 @@
 import { addDays, toISODate } from '@/lib/dates';
 
-import { getDb, transaction } from './db';
-import { createWidget, createDashboard } from './dashboards';
+import { collection, reserveIds } from './db';
+import { createDashboard, createWidget } from './dashboards';
 import { createProject, listStatuses } from './projects';
 import { createUser } from './users';
 
@@ -84,102 +84,124 @@ function random(seed) {
 }
 
 /**
+ * `insertMany` rejects an empty list, which a small seed can produce.
+ *
+ * @param {string} name
+ * @param {Object[]} docs
+ * @returns {Promise<void>}
+ */
+async function insertAll(name, docs) {
+    if (docs.length > 0) {
+        await (await collection(name)).insertMany(docs);
+    }
+}
+
+/**
  * Fills a fresh workspace with teammates, boards, tasks, time entries
  * and a starter dashboard, so the metrics have something to show.
  *
  * @param {number} adminId
- * @returns {void}
+ * @returns {Promise<void>}
  */
-export function seedDemoData(adminId) {
+export async function seedDemoData(adminId) {
     const next = random(42);
     const pick = (items) => items[Math.floor(next() * items.length)];
     const now = new Date();
+    const userIds = [adminId];
 
-    const userIds = [
-        adminId,
-        ...DEMO_USERS.map((user) => createUser({ ...user, password: DEMO_PASSWORD })),
-    ];
+    for (const user of DEMO_USERS) {
+        userIds.push(await createUser({ ...user, password: DEMO_PASSWORD }));
+    }
 
-    transaction(() => {
-        const db = getDb();
-        const insertTask = db.prepare(
-            `INSERT INTO tasks
-                (project_id, status_id, title, priority, assignee_id, creator_id, due_date,
-                 estimate_hours, position, created_at, updated_at, completed_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-        );
-        const insertTime = db.prepare(
-            'INSERT INTO time_entries (task_id, user_id, hours, note, date) VALUES (?, ?, ?, ?, ?)'
-        );
-        const insertComment = db.prepare(
-            'INSERT INTO comments (task_id, user_id, body, created_at) VALUES (?, ?, ?, ?)'
-        );
+    const tasks = [];
+    const timeEntries = [];
+    const comments = [];
 
-        for (const board of DEMO_BOARDS) {
-            const projectId = createProject({
-                name: board.name,
-                description: board.description,
-                color: board.color,
-                createdBy: adminId,
+    for (const board of DEMO_BOARDS) {
+        const projectId = await createProject({
+            name: board.name,
+            description: board.description,
+            color: board.color,
+            createdBy: adminId,
+        });
+        const statuses = await listStatuses(projectId);
+        const taskIds = await reserveIds('tasks', board.tasks.length);
+        const positions = new Map();
+
+        board.tasks.forEach((title, index) => {
+            const taskId = taskIds[index];
+            const status = pick(statuses);
+            const assigneeId = next() < 0.1 ? null : pick(userIds);
+            const createdDaysAgo = Math.floor(next() * 75) + 3;
+            const created = addDays(now, -createdDaysAgo);
+            const completed = status.isDone ? addDays(created, Math.floor(next() * (createdDaysAgo - 1)) + 1) : null;
+            const dueDate = next() < 0.8 ? toISODate(addDays(now, Math.floor(next() * 30) - 10)) : null;
+            const estimate = Math.round((next() * 14 + 1) * 2) / 2;
+            const position = positions.get(status.id) ?? 0;
+
+            positions.set(status.id, position + 1);
+
+            tasks.push({
+                _id: taskId,
+                projectId,
+                statusId: status.id,
+                title,
+                description: '',
+                priority: pick(PRIORITIES),
+                assigneeId,
+                creatorId: adminId,
+                dueDate,
+                estimateHours: estimate,
+                position,
+                createdAt: created,
+                updatedAt: created,
+                completedAt: completed,
             });
-            const statuses = listStatuses(projectId);
-            const positions = new Map();
 
-            board.tasks.forEach((title) => {
-                const status = pick(statuses);
-                const assigneeId = next() < 0.1 ? null : pick(userIds);
-                const createdDaysAgo = Math.floor(next() * 75) + 3;
-                const created = addDays(now, -createdDaysAgo);
-                const completed = status.isDone ? addDays(created, Math.floor(next() * (createdDaysAgo - 1)) + 1) : null;
-                const dueDate = next() < 0.8 ? toISODate(addDays(now, Math.floor(next() * 30) - 10)) : null;
-                const estimate = Math.round((next() * 14 + 1) * 2) / 2;
-                const position = positions.get(status.id) ?? 0;
-                const toTimestamp = (date) => date.toISOString().slice(0, 19).replace('T', ' ');
+            if (status.position > 0) {
+                const entries = Math.floor(next() * 6) + 1;
+                const lastDay = completed ?? now;
+                const span = Math.max(1, Math.round((lastDay - created) / 86400000));
 
-                positions.set(status.id, position + 1);
+                for (let entry = 0; entry < entries; entry += 1) {
+                    const day = addDays(created, Math.floor(next() * span));
 
-                const result = insertTask.run(
-                    projectId,
-                    status.id,
-                    title,
-                    pick(PRIORITIES),
-                    assigneeId,
-                    adminId,
-                    dueDate,
-                    estimate,
-                    position,
-                    toTimestamp(created),
-                    toTimestamp(created),
-                    completed ? toTimestamp(completed) : null
-                );
-                const taskId = Number(result.lastInsertRowid);
-
-                if (status.position > 0) {
-                    const entries = Math.floor(next() * 6) + 1;
-                    const lastDay = completed ?? now;
-                    const span = Math.max(1, Math.round((lastDay - created) / 86400000));
-
-                    for (let index = 0; index < entries; index += 1) {
-                        const day = addDays(created, Math.floor(next() * span));
-                        const hours = Math.round((next() * 5 + 0.5) * 4) / 4;
-
-                        insertTime.run(taskId, assigneeId ?? pick(userIds), hours, '', toISODate(day));
-                    }
-                }
-
-                if (next() < 0.4) {
-                    insertComment.run(
+                    timeEntries.push({
                         taskId,
-                        pick(userIds),
-                        pick(['Picking this up today.', 'Blocked on feedback from the client.', 'Draft is ready for review.', 'Can we split this into two tasks?']),
-                        toTimestamp(addDays(created, 1))
-                    );
+                        userId: assigneeId ?? pick(userIds),
+                        hours: Math.round((next() * 5 + 0.5) * 4) / 4,
+                        note: '',
+                        date: toISODate(day),
+                        startTime: null,
+                        endTime: null,
+                        createdAt: day,
+                    });
                 }
-            });
-        }
-    });
+            }
 
-    const dashboardId = createDashboard(adminId, 'Team overview');
+            if (next() < 0.4) {
+                comments.push({
+                    taskId,
+                    userId: pick(userIds),
+                    body: pick(['Picking this up today.', 'Blocked on feedback from the client.', 'Draft is ready for review.', 'Can we split this into two tasks?']),
+                    createdAt: addDays(created, 1),
+                });
+            }
+        });
+    }
+
+    const [entryIds, commentIds] = await Promise.all([
+        reserveIds('timeEntries', timeEntries.length),
+        reserveIds('comments', comments.length),
+    ]);
+
+    await Promise.all([
+        insertAll('tasks', tasks),
+        insertAll('timeEntries', timeEntries.map((entry, index) => ({ _id: entryIds[index], ...entry }))),
+        insertAll('comments', comments.map((comment, index) => ({ _id: commentIds[index], ...comment }))),
+    ]);
+
+    const dashboardId = await createDashboard(adminId, 'Team overview', { isShared: true });
     const widgets = [
         { title: 'My hours this week', width: 'third', config: { metric: 'hours_logged', groupBy: 'none', chart: 'number', filters: { dateRange: 'this_week', projectIds: [], userIds: ['me'], priorities: [], completion: 'any' } } },
         { title: 'Team hours this month', width: 'third', config: { metric: 'hours_logged', groupBy: 'none', chart: 'number', filters: { dateRange: 'this_month', projectIds: [], userIds: [], priorities: [], completion: 'any' } } },
@@ -190,6 +212,8 @@ export function seedDemoData(adminId) {
         { title: 'Completed per week', width: 'half', config: { metric: 'tasks_completed', groupBy: 'week', chart: 'bar', filters: { dateRange: 'last_90_days', projectIds: [], userIds: [], priorities: [], completion: 'any' } } },
     ];
 
-    widgets.forEach((widget) => createWidget(dashboardId, widget));
-    getDb().prepare('UPDATE dashboards SET is_shared = 1 WHERE id = ?').run(dashboardId);
+    // One at a time so positions follow the order above.
+    for (const widget of widgets) {
+        await createWidget(dashboardId, widget);
+    }
 }

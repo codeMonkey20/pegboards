@@ -9,8 +9,8 @@ import * as validate from '@/server/validation';
  * same day), in which case the hours are worked out from the range.
  */
 export default apiHandler({
-    POST(req, res) {
-        const user = requireUser(req);
+    async POST(req, res) {
+        const user = await requireUser(req);
         const taskId = parseId(req.query.id);
         const data = validate.body(req);
         const isRange = validate.has(data, 'startTime') || validate.has(data, 'endTime');
@@ -32,8 +32,8 @@ export default apiHandler({
             entry.hours = validate.number(data.hours, 'Hours', { min: 0.05, max: 24 });
         }
 
-        addTimeEntry(taskId, entry);
+        await addTimeEntry(taskId, entry);
 
-        res.status(201).json(getTaskDetail(taskId));
+        res.status(201).json(await getTaskDetail(taskId));
     },
 });

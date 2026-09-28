@@ -8,8 +8,8 @@ import * as validate from '@/server/validation';
  * color and password.
  */
 export default apiHandler({
-    PATCH(req, res) {
-        const currentUser = requireUser(req);
+    async PATCH(req, res) {
+        const currentUser = await requireUser(req);
         const id = parseId(req.query.id);
         const isSelf = currentUser.id === id;
         const isAdmin = currentUser.role === 'admin';
@@ -19,7 +19,7 @@ export default apiHandler({
             throw new HttpError(403, 'Only admins can edit other people');
         }
 
-        if (!getUser(id)) {
+        if (!(await getUser(id))) {
             throw new HttpError(404, 'User not found');
         }
 
@@ -57,7 +57,7 @@ export default apiHandler({
             changes.isActive = validate.boolean(data.isActive, 'Active');
         }
 
-        updateUser(id, changes);
-        res.status(200).json(getUser(id));
+        await updateUser(id, changes);
+        res.status(200).json(await getUser(id));
     },
 });

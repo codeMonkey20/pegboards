@@ -8,12 +8,12 @@ import * as validate from '@/server/validation';
  * one column (e.g. reordering) can affect the others.
  */
 export default apiHandler({
-    PATCH(req, res) {
-        requireUser(req);
+    async PATCH(req, res) {
+        await requireUser(req);
 
         const id = parseId(req.query.id);
         const data = validate.body(req);
-        const status = requireStatus(id);
+        const status = await requireStatus(id);
         const changes = {};
 
         if (validate.has(data, 'name')) {
@@ -28,22 +28,22 @@ export default apiHandler({
             changes.isDone = validate.boolean(data.isDone, 'Done');
         }
 
-        updateStatus(id, changes);
+        await updateStatus(id, changes);
 
         if (validate.has(data, 'move')) {
-            moveStatus(id, validate.oneOf(data.move, 'Move', [-1, 1]));
+            await moveStatus(id, validate.oneOf(data.move, 'Move', [-1, 1]));
         }
 
-        res.status(200).json(listStatuses(status.projectId));
+        res.status(200).json(await listStatuses(status.projectId));
     },
 
-    DELETE(req, res) {
-        requireUser(req);
+    async DELETE(req, res) {
+        await requireUser(req);
 
         const id = parseId(req.query.id);
-        const status = requireStatus(id);
+        const status = await requireStatus(id);
 
-        deleteStatus(id);
-        res.status(200).json(listStatuses(status.projectId));
+        await deleteStatus(id);
+        res.status(200).json(await listStatuses(status.projectId));
     },
 });

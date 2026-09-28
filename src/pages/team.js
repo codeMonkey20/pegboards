@@ -200,6 +200,6 @@ export default function TeamPage({ users: initialUsers, currentUser, nav }) {
     );
 }
 
-export const getServerSideProps = withPageAuth(({ user }) => ({
-    props: { users: listUsers({ includeInactive: user.role === 'admin' }) },
+export const getServerSideProps = withPageAuth(async ({ user }) => ({
+    props: { users: await listUsers({ includeInactive: user.role === 'admin' }) },
 }));

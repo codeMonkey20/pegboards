@@ -126,8 +126,8 @@ export default function HomePage({ tasks, hoursThisWeek, hoursLastWeek, todayISO
     );
 }
 
-export const getServerSideProps = withPageAuth(({ user }) => {
-    const hours = computeMetric(
+export const getServerSideProps = withPageAuth(async ({ user }) => {
+    const hours = await computeMetric(
         {
             metric: 'hours_logged',
             groupBy: 'none',
@@ -139,7 +139,7 @@ export const getServerSideProps = withPageAuth(({ user }) => {
 
     return {
         props: {
-            tasks: listAssignedTasks(user.id),
+            tasks: await listAssignedTasks(user.id),
             hoursThisWeek: hours.total ?? 0,
             hoursLastWeek: hours.previousTotal ?? 0,
             todayISO: today(),

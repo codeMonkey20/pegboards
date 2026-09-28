@@ -74,11 +74,11 @@ export default function LoginPage() {
  * @returns {Promise<Object>}
  */
 export async function getServerSideProps(context) {
-    if (needsSetup()) {
+    if (await needsSetup()) {
         return { redirect: { destination: '/setup', permanent: false } };
     }
 
-    if (getSessionUser(context.req)) {
+    if (await getSessionUser(context.req)) {
         return { redirect: { destination: '/', permanent: false } };
     }
 

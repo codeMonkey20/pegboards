@@ -80,7 +80,7 @@ export default function SetupPage({ demoPassword }) {
  * @returns {Promise<Object>}
  */
 export async function getServerSideProps() {
-    if (!needsSetup()) {
+    if (!(await needsSetup())) {
         return { redirect: { destination: '/login', permanent: false } };
     }
 

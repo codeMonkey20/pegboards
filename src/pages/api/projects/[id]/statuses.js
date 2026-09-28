@@ -4,15 +4,15 @@ import { createStatus, requireProject } from '@/server/projects';
 import * as validate from '@/server/validation';
 
 export default apiHandler({
-    POST(req, res) {
-        requireUser(req);
+    async POST(req, res) {
+        await requireUser(req);
 
         const projectId = parseId(req.query.id);
         const data = validate.body(req);
 
-        requireProject(projectId);
+        await requireProject(projectId);
 
-        const status = createStatus(projectId, {
+        const status = await createStatus(projectId, {
             name: validate.string(data.name, 'Name', { min: 1, max: 50 }),
             color: validate.color(data.color ?? '#898781', 'Color'),
             isDone: data.isDone === true,

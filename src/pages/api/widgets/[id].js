@@ -13,13 +13,13 @@ import { validateWidgetConfig } from '@/server/metrics';
 import * as validate from '@/server/validation';
 
 export default apiHandler({
-    PATCH(req, res) {
-        const user = requireUser(req);
-        const widget = requireWidget(parseId(req.query.id));
+    async PATCH(req, res) {
+        const user = await requireUser(req);
+        const widget = await requireWidget(parseId(req.query.id));
         const data = validate.body(req);
         const changes = {};
 
-        requireEditableDashboard(widget.dashboardId, user);
+        await requireEditableDashboard(widget.dashboardId, user);
 
         if (validate.has(data, 'title')) {
             changes.title = validate.string(data.title, 'Title', { min: 1, max: 100 });
@@ -33,21 +33,21 @@ export default apiHandler({
             changes.config = validateWidgetConfig(data.config);
         }
 
-        updateWidget(widget.id, changes);
+        await updateWidget(widget.id, changes);
 
         if (validate.has(data, 'move')) {
-            moveWidget(widget.id, validate.oneOf(data.move, 'Move', [-1, 1]));
+            await moveWidget(widget.id, validate.oneOf(data.move, 'Move', [-1, 1]));
         }
 
-        res.status(200).json(getWidget(widget.id, user.id));
+        res.status(200).json(await getWidget(widget.id, user.id));
     },
 
-    DELETE(req, res) {
-        const user = requireUser(req);
-        const widget = requireWidget(parseId(req.query.id));
+    async DELETE(req, res) {
+        const user = await requireUser(req);
+        const widget = await requireWidget(parseId(req.query.id));
 
-        requireEditableDashboard(widget.dashboardId, user);
-        deleteWidget(widget.id);
+        await requireEditableDashboard(widget.dashboardId, user);
+        await deleteWidget(widget.id);
         res.status(200).json({ ok: true });
     },
 });

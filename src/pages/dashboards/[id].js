@@ -235,7 +235,7 @@ export default function DashboardPage(props) {
     return <DashboardView key={props.dashboard.id} {...props} />;
 }
 
-export const getServerSideProps = withPageAuth(({ context, user }) => {
+export const getServerSideProps = withPageAuth(async ({ context, user }) => {
     const id = Number(context.params.id);
 
     if (!Number.isInteger(id)) {
@@ -243,14 +243,14 @@ export const getServerSideProps = withPageAuth(({ context, user }) => {
     }
 
     try {
-        const dashboard = requireDashboard(id, user);
+        const dashboard = await requireDashboard(id, user);
 
         return {
             props: {
                 dashboard,
-                widgets: listWidgets(id, user.id),
-                projects: listProjects().map(({ id: projectId, name }) => ({ id: projectId, name })),
-                users: listUsers().map(({ id: userId, name }) => ({ id: userId, name })),
+                widgets: await listWidgets(id, user.id),
+                projects: (await listProjects()).map(({ id: projectId, name }) => ({ id: projectId, name })),
+                users: (await listUsers()).map(({ id: userId, name }) => ({ id: userId, name })),
             },
         };
     } catch (error) {

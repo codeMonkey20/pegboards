@@ -11,7 +11,7 @@ import {
 } from '@/lib/constants';
 import { addDays, parseISODate, startOfWeek, toISODate } from '@/lib/dates';
 
-import { getDb } from './db';
+import { collection } from './db';
 import { HttpError } from './http';
 
 /**
@@ -39,96 +39,49 @@ import { HttpError } from './http';
  * @property {string|null} to
  */
 
-const TIME_SOURCE = `
-    time_entries te
-    JOIN tasks t ON t.id = te.task_id
-    JOIN projects p ON p.id = t.project_id
-    JOIN statuses s ON s.id = t.status_id
-    LEFT JOIN users u ON u.id = te.user_id
-`;
-
-const TASK_SOURCE = `
-    tasks t
-    JOIN projects p ON p.id = t.project_id
-    JOIN statuses s ON s.id = t.status_id
-    LEFT JOIN users u ON u.id = t.assignee_id
-`;
-
 /**
- * Every SQL fragment interpolated into a query comes from this table or
- * GROUPS below; user input only ever reaches SQL as bound parameters.
+ * How each metric is computed. `source` picks the collection: time
+ * entries (joined to their task) or tasks. `date` is the field the date
+ * range filters on; `aggregate` is how per-document values combine.
+ * Every query is built from these specs; user input only ever appears
+ * as values inside `$match`, never as field names or operators.
  */
-const METRIC_SQL = {
-    hours_logged: {
-        from: TIME_SOURCE,
-        value: 'ROUND(SUM(te.hours), 2)',
-        date: 'te.date',
-        user: 'te.user_id',
-        where: [],
-        fillWith: 0,
-    },
-    tasks_created: {
-        from: TASK_SOURCE,
-        value: 'COUNT(*)',
-        date: 'date(t.created_at)',
-        user: 't.assignee_id',
-        where: [],
-        fillWith: 0,
-    },
-    tasks_completed: {
-        from: TASK_SOURCE,
-        value: 'COUNT(*)',
-        date: 'date(t.completed_at)',
-        user: 't.assignee_id',
-        where: ['t.completed_at IS NOT NULL'],
-        fillWith: 0,
-    },
-    tasks_open: {
-        from: TASK_SOURCE,
-        value: 'COUNT(*)',
-        date: 'date(t.created_at)',
-        user: 't.assignee_id',
-        where: ['t.completed_at IS NULL'],
-        fillWith: 0,
-    },
+const METRIC_SPECS = {
+    hours_logged: { source: 'time', date: 'date', value: '$hours', aggregate: 'sum', decimals: 2 },
+    tasks_created: { source: 'tasks', date: 'createdAt', aggregate: 'count' },
+    tasks_completed: { source: 'tasks', date: 'completedAt', aggregate: 'count', match: () => ({ completedAt: { $ne: null } }) },
+    tasks_open: { source: 'tasks', date: 'createdAt', aggregate: 'count', match: () => ({ completedAt: null }) },
     tasks_overdue: {
-        from: TASK_SOURCE,
-        value: 'COUNT(*)',
-        date: 't.due_date',
-        user: 't.assignee_id',
-        where: ['t.completed_at IS NULL', 't.due_date IS NOT NULL', 't.due_date < :today'],
-        fillWith: 0,
+        source: 'tasks',
+        date: 'dueDate',
+        aggregate: 'count',
+        match: () => ({ completedAt: null, dueDate: { $ne: null, $lt: toISODate(new Date()) } }),
     },
     estimated_hours: {
-        from: TASK_SOURCE,
-        value: 'ROUND(COALESCE(SUM(t.estimate_hours), 0), 2)',
-        date: 'date(t.created_at)',
-        user: 't.assignee_id',
-        where: [],
-        fillWith: 0,
+        source: 'tasks',
+        date: 'createdAt',
+        value: { $ifNull: ['$estimateHours', 0] },
+        aggregate: 'sum',
+        decimals: 2,
     },
     avg_completion_days: {
-        from: TASK_SOURCE,
-        value: 'ROUND(AVG(julianday(t.completed_at) - julianday(t.created_at)), 1)',
-        date: 'date(t.completed_at)',
-        user: 't.assignee_id',
-        where: ['t.completed_at IS NOT NULL'],
-        fillWith: null,
+        source: 'tasks',
+        date: 'completedAt',
+        value: { $divide: [{ $subtract: ['$completedAt', '$createdAt'] }, 86400000] },
+        aggregate: 'avg',
+        decimals: 1,
+        match: () => ({ completedAt: { $ne: null } }),
     },
 };
 
-/**
- * Group key/label expressions. `{date}` is replaced with the metric's date column.
- */
-const GROUPS = {
-    user: { key: 'COALESCE(u.id, 0)', label: "COALESCE(u.name, 'Unassigned')" },
-    project: { key: 'p.id', label: 'p.name' },
-    status: { key: 's.name', label: 's.name' },
-    priority: { key: 't.priority', label: 't.priority' },
-    day: { key: '{date}', label: '{date}' },
-    week: { key: "date({date}, '-6 days', 'weekday 1')", label: "date({date}, '-6 days', 'weekday 1')" },
-    month: { key: "strftime('%Y-%m', {date})", label: "strftime('%Y-%m', {date})" },
+/** Where each groupable field lives, per source. Weeks and months are bucketed from `day` in JS. */
+const FIELDS = {
+    time: { user: '$userId', project: '$task.projectId', status: '$task.statusId', priority: '$task.priority', day: '$date' },
+    tasks: { user: '$assigneeId', project: '$projectId', status: '$statusId', priority: '$priority', day: '$day' },
 };
+
+/** Task timestamps are Dates; they become `YYYY-MM-DD` (UTC) so they compare with range bounds. */
+const DATE_FIELDS = new Set(['createdAt', 'completedAt']);
 
 const PRIORITY_ORDER = Object.fromEntries(PRIORITY_VALUES.map((value, index) => [value, index]));
 const MAX_CATEGORY_ROWS = 25;
@@ -293,69 +246,178 @@ export function resolveDateRange(filters, now = new Date()) {
 }
 
 /**
- * Builds the WHERE clause and parameters shared by the total and grouped queries.
+ * Builds the aggregation pipeline that filters a metric's documents and
+ * sums/counts them per group key.
  *
- * @param {typeof METRIC_SQL[keyof typeof METRIC_SQL]} metric
+ * @param {typeof METRIC_SPECS[keyof typeof METRIC_SPECS]} spec
  * @param {WidgetConfig['filters']} filters
  * @param {DateRange} range
  * @param {number} viewerId
- * @returns {{ where: string, params: Record<string, string|number> }}
+ * @param {string|null} groupField - Key from FIELDS, or null for one overall total.
+ * @returns {Object[]}
  */
-function buildWhere(metric, filters, range, viewerId) {
-    const conditions = [...metric.where];
-    /** @type {Record<string, string|number>} */
-    const params = {};
-
-    if (metric.where.some((condition) => condition.includes(':today'))) {
-        params.today = toISODate(new Date());
-    }
-
-    if (range.from) {
-        conditions.push(`${metric.date} >= :from`);
-        params.from = range.from;
-    }
-
-    if (range.to) {
-        conditions.push(`${metric.date} <= :to`);
-        params.to = range.to;
-    }
-
-    /**
-     * @param {string} column
-     * @param {string} prefix
-     * @param {(string|number)[]} values
-     */
-    const addIn = (column, prefix, values) => {
-        const names = values.map((value, index) => {
-            params[`${prefix}${index}`] = value;
-            return `:${prefix}${index}`;
-        });
-
-        conditions.push(`${column} IN (${names.join(', ')})`);
-    };
+function buildPipeline(spec, filters, range, viewerId, groupField) {
+    const userIds = filters.userIds.map((userId) => (userId === ME ? viewerId : userId));
+    const taskMatch = { ...(spec.match?.() ?? {}) };
+    const dayRange = {};
 
     if (filters.projectIds.length > 0) {
-        addIn('p.id', 'project', filters.projectIds);
-    }
-
-    if (filters.userIds.length > 0) {
-        addIn(metric.user, 'user', filters.userIds.map((userId) => (userId === ME ? viewerId : userId)));
+        taskMatch.projectId = { $in: filters.projectIds };
     }
 
     if (filters.priorities.length > 0) {
-        addIn('t.priority', 'priority', filters.priorities);
+        taskMatch.priority = { $in: filters.priorities };
     }
 
     if (filters.completion === 'open') {
-        conditions.push('t.completed_at IS NULL');
+        taskMatch.completedAt = null;
     } else if (filters.completion === 'done') {
-        conditions.push('t.completed_at IS NOT NULL');
+        taskMatch.completedAt = { $ne: null };
     }
 
-    return {
-        where: conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '',
-        params,
-    };
+    if (range.from) {
+        dayRange.$gte = range.from;
+    }
+
+    if (range.to) {
+        dayRange.$lte = range.to;
+    }
+
+    const hasDayRange = Object.keys(dayRange).length > 0;
+    const pipeline = [];
+
+    if (spec.source === 'time') {
+        const entryMatch = {};
+
+        if (hasDayRange) {
+            entryMatch.date = dayRange;
+        }
+
+        if (userIds.length > 0) {
+            entryMatch.userId = { $in: userIds };
+        }
+
+        pipeline.push(
+            { $match: entryMatch },
+            { $lookup: { from: 'tasks', localField: 'taskId', foreignField: '_id', as: 'task' } },
+            { $unwind: '$task' },
+            {
+                $match: Object.fromEntries(
+                    Object.entries(taskMatch).map(([field, condition]) => [`task.${field}`, condition])
+                ),
+            }
+        );
+    } else {
+        if (userIds.length > 0) {
+            taskMatch.assigneeId = { $in: userIds };
+        }
+
+        pipeline.push(
+            { $match: taskMatch },
+            {
+                $addFields: {
+                    day: DATE_FIELDS.has(spec.date)
+                        ? { $dateToString: { format: '%Y-%m-%d', date: `$${spec.date}` } }
+                        : `$${spec.date}`,
+                },
+            },
+            { $match: { day: { $ne: null, ...dayRange } } }
+        );
+    }
+
+    pipeline.push({
+        $group: {
+            _id: groupField ? FIELDS[spec.source][groupField] : null,
+            sum: { $sum: spec.value ?? 1 },
+            count: { $sum: 1 },
+        },
+    });
+
+    return pipeline;
+}
+
+/**
+ * Turns a group's sum and count into the metric's value.
+ *
+ * @param {typeof METRIC_SPECS[keyof typeof METRIC_SPECS]} spec
+ * @param {{ sum: number, count: number }} group
+ * @returns {number|null}
+ */
+function valueOf(spec, group) {
+    if (spec.aggregate === 'count') {
+        return group.count;
+    }
+
+    if (spec.aggregate === 'avg' && group.count === 0) {
+        return null;
+    }
+
+    const raw = spec.aggregate === 'avg' ? group.sum / group.count : group.sum;
+    const factor = 10 ** spec.decimals;
+
+    return Math.round(raw * factor) / factor;
+}
+
+/**
+ * @param {typeof METRIC_SPECS[keyof typeof METRIC_SPECS]} spec
+ * @param {Object[]} pipeline
+ * @returns {Promise<{ _id: any, sum: number, count: number }[]>}
+ */
+async function runPipeline(spec, pipeline) {
+    return (await collection(spec.source === 'time' ? 'timeEntries' : 'tasks')).aggregate(pipeline).toArray();
+}
+
+/**
+ * Loads display names for the ids that appear as group keys.
+ *
+ * @param {string} groupBy
+ * @param {any[]} keys
+ * @returns {Promise<Map<any, string>>}
+ */
+async function loadLabels(groupBy, keys) {
+    const collections = { user: 'users', project: 'projects', status: 'statuses' };
+
+    if (!collections[groupBy]) {
+        return new Map();
+    }
+
+    const docs = await (await collection(collections[groupBy]))
+        .find({ _id: { $in: keys.filter((key) => key !== null) } }, { projection: { name: 1 } })
+        .toArray();
+
+    return new Map(docs.map((doc) => [doc._id, doc.name]));
+}
+
+/**
+ * Maps a raw group key to its display key and label. Statuses merge by
+ * name (every board has its own "Done"); weeks and months bucket days.
+ *
+ * @param {string} groupBy
+ * @param {any} rawKey
+ * @param {Map<any, string>} labels
+ * @returns {{ key: string, label: string }}
+ */
+function bucketFor(groupBy, rawKey, labels) {
+    switch (groupBy) {
+        case 'user':
+            return rawKey === null
+                ? { key: '0', label: 'Unassigned' }
+                : { key: String(rawKey), label: labels.get(rawKey) ?? 'Deleted user' };
+        case 'project':
+            return { key: String(rawKey), label: labels.get(rawKey) ?? 'Deleted board' };
+        case 'status': {
+            const name = labels.get(rawKey) ?? 'Deleted column';
+            return { key: name, label: name };
+        }
+        case 'week': {
+            const key = toISODate(startOfWeek(parseISODate(rawKey)));
+            return { key, label: key };
+        }
+        case 'month':
+            return { key: rawKey.slice(0, 7), label: rawKey.slice(0, 7) };
+        default:
+            return { key: String(rawKey), label: String(rawKey) };
+    }
 }
 
 /**
@@ -415,17 +477,20 @@ function fillPeriods(rows, range, groupBy, fillWith) {
 }
 
 /**
- * @param {typeof METRIC_SQL[keyof typeof METRIC_SQL]} metric
+ * @param {typeof METRIC_SPECS[keyof typeof METRIC_SPECS]} spec
  * @param {WidgetConfig['filters']} filters
  * @param {DateRange} range
  * @param {number} viewerId
- * @returns {number|null}
+ * @returns {Promise<number|null>}
  */
-function queryTotal(metric, filters, range, viewerId) {
-    const { where, params } = buildWhere(metric, filters, range, viewerId);
-    const row = getDb().prepare(`SELECT ${metric.value} AS value FROM ${metric.from} ${where}`).get(params);
+async function queryTotal(spec, filters, range, viewerId) {
+    const [group] = await runPipeline(spec, buildPipeline(spec, filters, range, viewerId, null));
 
-    return row?.value ?? (metric.fillWith === null ? null : 0);
+    if (!group) {
+        return spec.aggregate === 'avg' ? null : 0;
+    }
+
+    return valueOf(spec, group);
 }
 
 /**
@@ -433,44 +498,55 @@ function queryTotal(metric, filters, range, viewerId) {
  *
  * @param {WidgetConfig} config
  * @param {number} viewerId - Resolves the "me" people filter.
- * @returns {MetricResult}
+ * @returns {Promise<MetricResult>}
  */
-export function computeMetric(config, viewerId) {
-    const metric = METRIC_SQL[config.metric];
+export async function computeMetric(config, viewerId) {
+    const spec = METRIC_SPECS[config.metric];
     const { current, previous } = resolveDateRange(config.filters);
-    const total = queryTotal(metric, config.filters, current, viewerId);
-    const previousTotal = previous ? queryTotal(metric, config.filters, previous, viewerId) : null;
+    const [total, previousTotal] = await Promise.all([
+        queryTotal(spec, config.filters, current, viewerId),
+        previous ? queryTotal(spec, config.filters, previous, viewerId) : null,
+    ]);
 
     if (config.groupBy === 'none') {
         return { total, previousTotal, rows: [], range: current };
     }
 
-    const group = GROUPS[config.groupBy];
-    const keyExpression = group.key.replaceAll('{date}', metric.date);
-    const labelExpression = group.label.replaceAll('{date}', metric.date);
     const isTimeGroup = TIME_GROUP_BYS.includes(config.groupBy);
-    const { where, params } = buildWhere(metric, config.filters, current, viewerId);
-    const whereWithKey = isTimeGroup
-        ? `${where ? `${where} AND` : 'WHERE'} ${metric.date} IS NOT NULL`
-        : where;
+    const groups = await runPipeline(
+        spec,
+        buildPipeline(spec, config.filters, current, viewerId, isTimeGroup ? 'day' : config.groupBy)
+    );
+    const labels = await loadLabels(config.groupBy, groups.map((group) => group._id));
+    const buckets = new Map();
 
-    let rows = getDb()
-        .prepare(
-            `SELECT ${keyExpression} AS key, ${labelExpression} AS label, ${metric.value} AS value
-             FROM ${metric.from}
-             ${whereWithKey}
-             GROUP BY key
-             ORDER BY ${isTimeGroup ? 'key ASC' : 'value DESC'}`
-        )
-        .all(params)
-        .map((row) => ({ key: String(row.key), label: String(row.label), value: row.value }));
+    for (const group of groups) {
+        const { key, label } = bucketFor(config.groupBy, group._id, labels);
+        const bucket = buckets.get(key) ?? { key, label, sum: 0, count: 0 };
+
+        bucket.sum += group.sum;
+        bucket.count += group.count;
+        buckets.set(key, bucket);
+    }
+
+    let rows = [...buckets.values()].map((bucket) => ({
+        key: bucket.key,
+        label: bucket.label,
+        value: valueOf(spec, bucket),
+    }));
 
     if (isTimeGroup) {
-        rows = fillPeriods(rows, current, /** @type {'day'|'week'|'month'} */ (config.groupBy), metric.fillWith);
+        rows.sort((a, b) => (a.key < b.key ? -1 : 1));
+        rows = fillPeriods(
+            rows,
+            current,
+            /** @type {'day'|'week'|'month'} */ (config.groupBy),
+            spec.aggregate === 'avg' ? null : 0
+        );
     } else if (config.groupBy === 'priority') {
         rows.sort((a, b) => PRIORITY_ORDER[a.key] - PRIORITY_ORDER[b.key]);
     } else {
-        rows = rows.slice(0, MAX_CATEGORY_ROWS);
+        rows = rows.sort((a, b) => (b.value ?? 0) - (a.value ?? 0)).slice(0, MAX_CATEGORY_ROWS);
     }
 
     return { total, previousTotal, rows, range: current };

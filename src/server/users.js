@@ -1,7 +1,7 @@
 import { COLORS } from '@/lib/constants';
 
 import { hashPassword } from './auth';
-import { getDb } from './db';
+import { collection, insertWithId } from './db';
 import { HttpError } from './http';
 
 /**
@@ -14,18 +14,20 @@ import { HttpError } from './http';
  * @property {boolean} isActive
  */
 
+const PUBLIC_FIELDS = { name: 1, email: 1, role: 1, color: 1, isActive: 1 };
+
 /**
- * @param {Object} row
+ * @param {Object} doc
  * @returns {User}
  */
-function toUser(row) {
+function toUser(doc) {
     return {
-        id: row.id,
-        name: row.name,
-        email: row.email,
-        role: row.role,
-        color: row.color,
-        isActive: row.is_active === 1,
+        id: doc._id,
+        name: doc.name,
+        email: doc.email,
+        role: doc.role,
+        color: doc.color,
+        isActive: doc.isActive,
     };
 }
 
@@ -34,44 +36,38 @@ function toUser(row) {
  *
  * @param {Object} [options]
  * @param {boolean} [options.includeInactive=false]
- * @returns {User[]}
+ * @returns {Promise<User[]>}
  */
-export function listUsers({ includeInactive = false } = {}) {
-    const rows = getDb()
-        .prepare(
-            `SELECT id, name, email, role, color, is_active FROM users
-             ${includeInactive ? '' : 'WHERE is_active = 1'}
-             ORDER BY is_active DESC, name COLLATE NOCASE`
-        )
-        .all();
+export async function listUsers({ includeInactive = false } = {}) {
+    const docs = await (await collection('users'))
+        .find(includeInactive ? {} : { isActive: true }, { projection: PUBLIC_FIELDS })
+        .collation({ locale: 'en', strength: 2 })
+        .sort({ isActive: -1, name: 1 })
+        .toArray();
 
-    return rows.map(toUser);
+    return docs.map(toUser);
 }
 
 /**
  * @param {number} id
- * @returns {User|null}
+ * @returns {Promise<User|null>}
  */
-export function getUser(id) {
-    const row = getDb()
-        .prepare('SELECT id, name, email, role, color, is_active FROM users WHERE id = ?')
-        .get(id);
+export async function getUser(id) {
+    const doc = await (await collection('users')).findOne({ _id: id }, { projection: PUBLIC_FIELDS });
 
-    return row ? toUser(row) : null;
+    return doc ? toUser(doc) : null;
 }
 
 /**
  * Looks up a user with their password hash, for sign-in only.
  *
  * @param {string} email
- * @returns {{ id: number, passwordHash: string, isActive: boolean }|null}
+ * @returns {Promise<{ id: number, passwordHash: string, isActive: boolean }|null>}
  */
-export function getCredentials(email) {
-    const row = getDb()
-        .prepare('SELECT id, password_hash, is_active FROM users WHERE email = ?')
-        .get(email);
+export async function getCredentials(email) {
+    const doc = await (await collection('users')).findOne({ email });
 
-    return row ? { id: row.id, passwordHash: row.password_hash, isActive: row.is_active === 1 } : null;
+    return doc ? { id: doc._id, passwordHash: doc.passwordHash, isActive: doc.isActive } : null;
 }
 
 /**
@@ -79,26 +75,39 @@ export function getCredentials(email) {
  *
  * @param {Object} data
  * @param {string} data.name
- * @param {string} data.email
+ * @param {string} data.email - Already lowercased by validation.
  * @param {string} data.password
  * @param {'admin'|'member'} [data.role='member']
  * @param {string} [data.color]
- * @returns {number} The new user's id.
+ * @returns {Promise<number>} The new user's id.
  */
-export function createUser({ name, email, password, role = 'member', color }) {
-    const db = getDb();
-    const existing = db.prepare('SELECT id FROM users WHERE email = ?').get(email);
+export async function createUser({ name, email, password, role = 'member', color }) {
+    const users = await collection('users');
 
-    if (existing) {
+    if (await users.findOne({ email })) {
         throw new HttpError(409, 'Someone already uses that email');
     }
 
-    const count = db.prepare('SELECT COUNT(*) AS count FROM users').get().count;
-    const result = db
-        .prepare('INSERT INTO users (name, email, password_hash, role, color) VALUES (?, ?, ?, ?, ?)')
-        .run(name, email, hashPassword(password), role, color ?? COLORS[count % COLORS.length]);
+    const count = await users.countDocuments();
 
-    return Number(result.lastInsertRowid);
+    try {
+        return await insertWithId('users', {
+            name,
+            email,
+            passwordHash: hashPassword(password),
+            role,
+            color: color ?? COLORS[count % COLORS.length],
+            isActive: true,
+            createdAt: new Date(),
+        });
+    } catch (error) {
+        // Two sign-ups racing past the check above hit the unique index instead.
+        if (error.code === 11000) {
+            throw new HttpError(409, 'Someone already uses that email');
+        }
+
+        throw error;
+    }
 }
 
 /**
@@ -112,65 +121,42 @@ export function createUser({ name, email, password, role = 'member', color }) {
  * @param {'admin'|'member'} [changes.role]
  * @param {string} [changes.color]
  * @param {boolean} [changes.isActive]
- * @returns {void}
+ * @returns {Promise<void>}
  */
-export function updateUser(id, changes) {
-    const db = getDb();
-    const columns = [];
-    const values = [];
+export async function updateUser(id, changes) {
+    const users = await collection('users');
+    const update = {};
 
-    if (changes.email !== undefined) {
-        const clash = db.prepare('SELECT id FROM users WHERE email = ? AND id != ?').get(changes.email, id);
-
-        if (clash) {
-            throw new HttpError(409, 'Someone already uses that email');
-        }
+    if (changes.email !== undefined && (await users.findOne({ email: changes.email, _id: { $ne: id } }))) {
+        throw new HttpError(409, 'Someone already uses that email');
     }
 
-    const wouldLoseAdmin = changes.role === 'member' || changes.isActive === false;
-
-    if (wouldLoseAdmin) {
-        const otherAdmins = db
-            .prepare("SELECT COUNT(*) AS count FROM users WHERE role = 'admin' AND is_active = 1 AND id != ?")
-            .get(id).count;
-        const target = db.prepare('SELECT role FROM users WHERE id = ?').get(id);
+    if (changes.role === 'member' || changes.isActive === false) {
+        const target = await users.findOne({ _id: id }, { projection: { role: 1 } });
+        const otherAdmins = await users.countDocuments({ role: 'admin', isActive: true, _id: { $ne: id } });
 
         if (target?.role === 'admin' && otherAdmins === 0) {
             throw new HttpError(400, 'The workspace needs at least one active admin');
         }
     }
 
-    const mapping = {
-        name: 'name',
-        email: 'email',
-        role: 'role',
-        color: 'color',
-    };
-
-    for (const [key, column] of Object.entries(mapping)) {
+    for (const key of ['name', 'email', 'role', 'color', 'isActive']) {
         if (changes[key] !== undefined) {
-            columns.push(`${column} = ?`);
-            values.push(changes[key]);
+            update[key] = changes[key];
         }
     }
 
     if (changes.password !== undefined) {
-        columns.push('password_hash = ?');
-        values.push(hashPassword(changes.password));
+        update.passwordHash = hashPassword(changes.password);
     }
 
-    if (changes.isActive !== undefined) {
-        columns.push('is_active = ?');
-        values.push(changes.isActive ? 1 : 0);
-    }
-
-    if (columns.length === 0) {
+    if (Object.keys(update).length === 0) {
         return;
     }
 
-    db.prepare(`UPDATE users SET ${columns.join(', ')} WHERE id = ?`).run(...values, id);
+    await users.updateOne({ _id: id }, { $set: update });
 
     if (changes.isActive === false || changes.password !== undefined) {
-        db.prepare('DELETE FROM sessions WHERE user_id = ?').run(id);
+        await (await collection('sessions')).deleteMany({ userId: id });
     }
 }

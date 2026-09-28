@@ -4,14 +4,14 @@ import { deleteProject, requireProject, updateProject } from '@/server/projects'
 import * as validate from '@/server/validation';
 
 export default apiHandler({
-    PATCH(req, res) {
-        requireUser(req);
+    async PATCH(req, res) {
+        await requireUser(req);
 
         const id = parseId(req.query.id);
         const data = validate.body(req);
         const changes = {};
 
-        requireProject(id);
+        await requireProject(id);
 
         if (validate.has(data, 'name')) {
             changes.name = validate.string(data.name, 'Name', { min: 1, max: 100 });
@@ -25,17 +25,17 @@ export default apiHandler({
             changes.color = validate.color(data.color, 'Color');
         }
 
-        updateProject(id, changes);
-        res.status(200).json(requireProject(id));
+        await updateProject(id, changes);
+        res.status(200).json(await requireProject(id));
     },
 
-    DELETE(req, res) {
-        requireUser(req, { admin: true });
+    async DELETE(req, res) {
+        await requireUser(req, { admin: true });
 
         const id = parseId(req.query.id);
 
-        requireProject(id);
-        deleteProject(id);
+        await requireProject(id);
+        await deleteProject(id);
         res.status(200).json({ ok: true });
     },
 });

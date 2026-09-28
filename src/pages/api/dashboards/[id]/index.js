@@ -4,13 +4,13 @@ import { apiHandler, parseId } from '@/server/http';
 import * as validate from '@/server/validation';
 
 export default apiHandler({
-    PATCH(req, res) {
-        const user = requireUser(req);
+    async PATCH(req, res) {
+        const user = await requireUser(req);
         const id = parseId(req.query.id);
         const data = validate.body(req);
         const changes = {};
 
-        requireEditableDashboard(id, user);
+        await requireEditableDashboard(id, user);
 
         if (validate.has(data, 'name')) {
             changes.name = validate.string(data.name, 'Name', { min: 1, max: 100 });
@@ -20,16 +20,16 @@ export default apiHandler({
             changes.isShared = validate.boolean(data.isShared, 'Shared');
         }
 
-        updateDashboard(id, changes);
-        res.status(200).json(requireDashboard(id, user));
+        await updateDashboard(id, changes);
+        res.status(200).json(await requireDashboard(id, user));
     },
 
-    DELETE(req, res) {
-        const user = requireUser(req);
+    async DELETE(req, res) {
+        const user = await requireUser(req);
         const id = parseId(req.query.id);
 
-        requireEditableDashboard(id, user);
-        deleteDashboard(id);
+        await requireEditableDashboard(id, user);
+        await deleteDashboard(id);
         res.status(200).json({ ok: true });
     },
 });

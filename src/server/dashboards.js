@@ -1,4 +1,4 @@
-import { getDb, transaction } from './db';
+import { collection, insertWithId, setPositions } from './db';
 import { HttpError } from './http';
 import { computeMetric, sanitizeWidgetConfig } from './metrics';
 
@@ -22,39 +22,49 @@ import { computeMetric, sanitizeWidgetConfig } from './metrics';
  * @property {import('./metrics').MetricResult} data
  */
 
-const DASHBOARD_SELECT = `
-    SELECT d.id, d.name, d.owner_id, d.is_shared, u.name AS owner_name,
-           (SELECT COUNT(*) FROM widgets WHERE dashboard_id = d.id) AS widget_count
-    FROM dashboards d
-    JOIN users u ON u.id = d.owner_id
-`;
-
 /**
- * @param {Object} row
- * @returns {Dashboard}
+ * Adds owner names and widget counts to dashboard documents.
+ *
+ * @param {Object[]} docs
+ * @returns {Promise<Dashboard[]>}
  */
-function toDashboard(row) {
-    return {
-        id: row.id,
-        name: row.name,
-        ownerId: row.owner_id,
-        ownerName: row.owner_name,
-        isShared: row.is_shared === 1,
-        widgetCount: row.widget_count,
-    };
+async function toDashboards(docs) {
+    const ids = docs.map((doc) => doc._id);
+    const [owners, counts] = await Promise.all([
+        (await collection('users'))
+            .find({ _id: { $in: docs.map((doc) => doc.ownerId) } }, { projection: { name: 1 } })
+            .toArray(),
+        (await collection('widgets'))
+            .aggregate([{ $match: { dashboardId: { $in: ids } } }, { $group: { _id: '$dashboardId', total: { $sum: 1 } } }])
+            .toArray(),
+    ]);
+    const ownerNames = new Map(owners.map((owner) => [owner._id, owner.name]));
+    const widgetCounts = new Map(counts.map((count) => [count._id, count.total]));
+
+    return docs.map((doc) => ({
+        id: doc._id,
+        name: doc.name,
+        ownerId: doc.ownerId,
+        ownerName: ownerNames.get(doc.ownerId) ?? 'Deleted user',
+        isShared: doc.isShared,
+        widgetCount: widgetCounts.get(doc._id) ?? 0,
+    }));
 }
 
 /**
  * Dashboards the user owns, plus ones teammates have shared.
  *
  * @param {number} userId
- * @returns {Dashboard[]}
+ * @returns {Promise<Dashboard[]>}
  */
-export function listDashboards(userId) {
-    return getDb()
-        .prepare(`${DASHBOARD_SELECT} WHERE d.owner_id = ? OR d.is_shared = 1 ORDER BY d.name COLLATE NOCASE`)
-        .all(userId)
-        .map(toDashboard);
+export async function listDashboards(userId) {
+    const docs = await (await collection('dashboards'))
+        .find({ $or: [{ ownerId: userId }, { isShared: true }] })
+        .collation({ locale: 'en', strength: 2 })
+        .sort({ name: 1 })
+        .toArray();
+
+    return toDashboards(docs);
 }
 
 /**
@@ -62,16 +72,18 @@ export function listDashboards(userId) {
  *
  * @param {number} id
  * @param {import('./auth').SessionUser} user
- * @returns {Dashboard & { canEdit: boolean }}
+ * @returns {Promise<Dashboard & { canEdit: boolean }>}
  */
-export function requireDashboard(id, user) {
-    const row = getDb().prepare(`${DASHBOARD_SELECT} WHERE d.id = ?`).get(id);
+export async function requireDashboard(id, user) {
+    const doc = await (await collection('dashboards')).findOne({ _id: id });
 
-    if (!row || (row.owner_id !== user.id && row.is_shared !== 1)) {
+    if (!doc || (doc.ownerId !== user.id && !doc.isShared)) {
         throw new HttpError(404, 'Dashboard not found');
     }
 
-    return { ...toDashboard(row), canEdit: row.owner_id === user.id || user.role === 'admin' };
+    const [dashboard] = await toDashboards([doc]);
+
+    return { ...dashboard, canEdit: doc.ownerId === user.id || user.role === 'admin' };
 }
 
 /**
@@ -79,10 +91,10 @@ export function requireDashboard(id, user) {
  *
  * @param {number} id
  * @param {import('./auth').SessionUser} user
- * @returns {Dashboard}
+ * @returns {Promise<Dashboard>}
  */
-export function requireEditableDashboard(id, user) {
-    const dashboard = requireDashboard(id, user);
+export async function requireEditableDashboard(id, user) {
+    const dashboard = await requireDashboard(id, user);
 
     if (!dashboard.canEdit) {
         throw new HttpError(403, 'Only the owner can change this dashboard');
@@ -94,62 +106,60 @@ export function requireEditableDashboard(id, user) {
 /**
  * @param {number} ownerId
  * @param {string} name
- * @returns {number}
+ * @param {Object} [options]
+ * @param {boolean} [options.isShared=false]
+ * @returns {Promise<number>}
  */
-export function createDashboard(ownerId, name) {
-    const result = getDb().prepare('INSERT INTO dashboards (owner_id, name) VALUES (?, ?)').run(ownerId, name);
-
-    return Number(result.lastInsertRowid);
+export async function createDashboard(ownerId, name, { isShared = false } = {}) {
+    return insertWithId('dashboards', { name, ownerId, isShared, createdAt: new Date() });
 }
 
 /**
  * @param {number} id
  * @param {{ name?: string, isShared?: boolean }} changes
- * @returns {void}
+ * @returns {Promise<void>}
  */
-export function updateDashboard(id, changes) {
-    const db = getDb();
+export async function updateDashboard(id, changes) {
+    const update = {};
 
-    if (changes.name !== undefined) {
-        db.prepare('UPDATE dashboards SET name = ? WHERE id = ?').run(changes.name, id);
+    for (const key of ['name', 'isShared']) {
+        if (changes[key] !== undefined) {
+            update[key] = changes[key];
+        }
     }
 
-    if (changes.isShared !== undefined) {
-        db.prepare('UPDATE dashboards SET is_shared = ? WHERE id = ?').run(changes.isShared ? 1 : 0, id);
+    if (Object.keys(update).length > 0) {
+        await (await collection('dashboards')).updateOne({ _id: id }, { $set: update });
     }
 }
 
 /**
+ * Deletes a dashboard and its widgets.
+ *
  * @param {number} id
- * @returns {void}
+ * @returns {Promise<void>}
  */
-export function deleteDashboard(id) {
-    getDb().prepare('DELETE FROM dashboards WHERE id = ?').run(id);
+export async function deleteDashboard(id) {
+    await (await collection('widgets')).deleteMany({ dashboardId: id });
+    await (await collection('dashboards')).deleteOne({ _id: id });
 }
 
 /**
- * @param {Object} row
+ * @param {Object} doc
  * @param {number} viewerId
- * @returns {Widget}
+ * @returns {Promise<Widget>}
  */
-function toWidget(row, viewerId) {
-    let parsed = null;
-
-    try {
-        parsed = JSON.parse(row.config);
-    } catch (error) {
-        console.error(`Widget ${row.id} has an unreadable config; using defaults.`, error);
-    }
-
-    const config = sanitizeWidgetConfig(parsed);
+async function toWidget(doc, viewerId) {
+    // Sanitised on read so one bad document can't break a dashboard.
+    const config = sanitizeWidgetConfig(doc.config);
 
     return {
-        id: row.id,
-        title: row.title,
+        id: doc._id,
+        title: doc.title,
         config,
-        width: row.width,
-        position: row.position,
-        data: computeMetric(config, viewerId),
+        width: doc.width,
+        position: doc.position,
+        data: await computeMetric(config, viewerId),
     };
 }
 
@@ -158,38 +168,37 @@ function toWidget(row, viewerId) {
  *
  * @param {number} dashboardId
  * @param {number} viewerId
- * @returns {Widget[]}
+ * @returns {Promise<Widget[]>}
  */
-export function listWidgets(dashboardId, viewerId) {
-    return getDb()
-        .prepare('SELECT * FROM widgets WHERE dashboard_id = ? ORDER BY position, id')
-        .all(dashboardId)
-        .map((row) => toWidget(row, viewerId));
+export async function listWidgets(dashboardId, viewerId) {
+    const docs = await (await collection('widgets')).find({ dashboardId }).sort({ position: 1, _id: 1 }).toArray();
+
+    return Promise.all(docs.map((doc) => toWidget(doc, viewerId)));
 }
 
 /**
- * Loads a widget and the dashboard it sits on.
+ * Loads a widget's id and the dashboard it sits on.
  *
  * @param {number} id
- * @returns {{ id: number, dashboardId: number }}
+ * @returns {Promise<{ id: number, dashboardId: number }>}
  */
-export function requireWidget(id) {
-    const row = getDb().prepare('SELECT id, dashboard_id FROM widgets WHERE id = ?').get(id);
+export async function requireWidget(id) {
+    const doc = await (await collection('widgets')).findOne({ _id: id }, { projection: { dashboardId: 1 } });
 
-    if (!row) {
+    if (!doc) {
         throw new HttpError(404, 'Widget not found');
     }
 
-    return { id: row.id, dashboardId: row.dashboard_id };
+    return { id: doc._id, dashboardId: doc.dashboardId };
 }
 
 /**
  * @param {number} id
  * @param {number} viewerId
- * @returns {Widget}
+ * @returns {Promise<Widget>}
  */
-export function getWidget(id, viewerId) {
-    return toWidget(getDb().prepare('SELECT * FROM widgets WHERE id = ?').get(id), viewerId);
+export async function getWidget(id, viewerId) {
+    return toWidget(await (await collection('widgets')).findOne({ _id: id }), viewerId);
 }
 
 /**
@@ -197,38 +206,36 @@ export function getWidget(id, viewerId) {
  *
  * @param {number} dashboardId
  * @param {{ title: string, config: import('@/lib/constants').WidgetConfig, width: string }} data
- * @returns {number}
+ * @returns {Promise<number>}
  */
-export function createWidget(dashboardId, { title, config, width }) {
-    const db = getDb();
-    const { next } = db
-        .prepare('SELECT COALESCE(MAX(position), -1) + 1 AS next FROM widgets WHERE dashboard_id = ?')
-        .get(dashboardId);
-    const result = db
-        .prepare('INSERT INTO widgets (dashboard_id, title, config, width, position) VALUES (?, ?, ?, ?, ?)')
-        .run(dashboardId, title, JSON.stringify(config), width, next);
+export async function createWidget(dashboardId, { title, config, width }) {
+    const last = await (await collection('widgets')).findOne({ dashboardId }, { sort: { position: -1 } });
 
-    return Number(result.lastInsertRowid);
+    return insertWithId('widgets', {
+        dashboardId,
+        title,
+        config,
+        width,
+        position: last ? last.position + 1 : 0,
+    });
 }
 
 /**
  * @param {number} id
  * @param {{ title?: string, config?: import('@/lib/constants').WidgetConfig, width?: string }} changes
- * @returns {void}
+ * @returns {Promise<void>}
  */
-export function updateWidget(id, changes) {
-    const db = getDb();
+export async function updateWidget(id, changes) {
+    const update = {};
 
-    if (changes.title !== undefined) {
-        db.prepare('UPDATE widgets SET title = ? WHERE id = ?').run(changes.title, id);
+    for (const key of ['title', 'config', 'width']) {
+        if (changes[key] !== undefined) {
+            update[key] = changes[key];
+        }
     }
 
-    if (changes.config !== undefined) {
-        db.prepare('UPDATE widgets SET config = ? WHERE id = ?').run(JSON.stringify(changes.config), id);
-    }
-
-    if (changes.width !== undefined) {
-        db.prepare('UPDATE widgets SET width = ? WHERE id = ?').run(changes.width, id);
+    if (Object.keys(update).length > 0) {
+        await (await collection('widgets')).updateOne({ _id: id }, { $set: update });
     }
 }
 
@@ -237,34 +244,28 @@ export function updateWidget(id, changes) {
  *
  * @param {number} id
  * @param {-1|1} direction
- * @returns {void}
+ * @returns {Promise<void>}
  */
-export function moveWidget(id, direction) {
-    transaction(() => {
-        const db = getDb();
-        const { dashboardId } = requireWidget(id);
-        const ids = db
-            .prepare('SELECT id FROM widgets WHERE dashboard_id = ? ORDER BY position, id')
-            .all(dashboardId)
-            .map((row) => row.id);
-        const index = ids.indexOf(id);
-        const target = index + direction;
+export async function moveWidget(id, direction) {
+    const { dashboardId } = await requireWidget(id);
+    const ids = (await (await collection('widgets')).find({ dashboardId }).sort({ position: 1, _id: 1 }).toArray()).map(
+        (doc) => doc._id
+    );
+    const index = ids.indexOf(id);
+    const target = index + direction;
 
-        if (target < 0 || target >= ids.length) {
-            return;
-        }
+    if (target < 0 || target >= ids.length) {
+        return;
+    }
 
-        [ids[index], ids[target]] = [ids[target], ids[index]];
-
-        const update = db.prepare('UPDATE widgets SET position = ? WHERE id = ?');
-        ids.forEach((widgetId, position) => update.run(position, widgetId));
-    });
+    [ids[index], ids[target]] = [ids[target], ids[index]];
+    await setPositions('widgets', ids);
 }
 
 /**
  * @param {number} id
- * @returns {void}
+ * @returns {Promise<void>}
  */
-export function deleteWidget(id) {
-    getDb().prepare('DELETE FROM widgets WHERE id = ?').run(id);
+export async function deleteWidget(id) {
+    await (await collection('widgets')).deleteOne({ _id: id });
 }

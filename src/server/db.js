@@ -1,216 +1,151 @@
-import fs from 'node:fs';
-import path from 'node:path';
-import { DatabaseSync } from 'node:sqlite';
-
-const SCHEMA = `
-CREATE TABLE IF NOT EXISTS users (
-    id INTEGER PRIMARY KEY,
-    name TEXT NOT NULL,
-    email TEXT NOT NULL UNIQUE COLLATE NOCASE,
-    password_hash TEXT NOT NULL,
-    role TEXT NOT NULL DEFAULT 'member' CHECK (role IN ('admin', 'member')),
-    color TEXT NOT NULL DEFAULT '#2a78d6',
-    is_active INTEGER NOT NULL DEFAULT 1,
-    created_at TEXT NOT NULL DEFAULT (datetime('now'))
-);
-
-CREATE TABLE IF NOT EXISTS sessions (
-    token_hash TEXT PRIMARY KEY,
-    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    expires_at TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS projects (
-    id INTEGER PRIMARY KEY,
-    name TEXT NOT NULL,
-    description TEXT NOT NULL DEFAULT '',
-    color TEXT NOT NULL DEFAULT '#2a78d6',
-    created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
-    created_at TEXT NOT NULL DEFAULT (datetime('now'))
-);
-
-CREATE TABLE IF NOT EXISTS statuses (
-    id INTEGER PRIMARY KEY,
-    project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-    name TEXT NOT NULL,
-    color TEXT NOT NULL DEFAULT '#898781',
-    position INTEGER NOT NULL DEFAULT 0,
-    is_done INTEGER NOT NULL DEFAULT 0
-);
-
-CREATE TABLE IF NOT EXISTS tasks (
-    id INTEGER PRIMARY KEY,
-    project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-    status_id INTEGER NOT NULL REFERENCES statuses(id),
-    title TEXT NOT NULL,
-    description TEXT NOT NULL DEFAULT '',
-    priority TEXT NOT NULL DEFAULT 'normal' CHECK (priority IN ('urgent', 'high', 'normal', 'low')),
-    assignee_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
-    creator_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
-    due_date TEXT,
-    estimate_hours REAL,
-    position INTEGER NOT NULL DEFAULT 0,
-    created_at TEXT NOT NULL DEFAULT (datetime('now')),
-    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
-    completed_at TEXT
-);
-
-CREATE TABLE IF NOT EXISTS time_entries (
-    id INTEGER PRIMARY KEY,
-    task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
-    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    hours REAL NOT NULL CHECK (hours > 0),
-    note TEXT NOT NULL DEFAULT '',
-    date TEXT NOT NULL,
-    start_time TEXT,
-    end_time TEXT,
-    created_at TEXT NOT NULL DEFAULT (datetime('now'))
-);
-
-CREATE TABLE IF NOT EXISTS comments (
-    id INTEGER PRIMARY KEY,
-    task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
-    user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
-    body TEXT NOT NULL,
-    created_at TEXT NOT NULL DEFAULT (datetime('now'))
-);
-
-CREATE TABLE IF NOT EXISTS dashboards (
-    id INTEGER PRIMARY KEY,
-    name TEXT NOT NULL,
-    owner_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    is_shared INTEGER NOT NULL DEFAULT 0,
-    created_at TEXT NOT NULL DEFAULT (datetime('now'))
-);
-
-CREATE TABLE IF NOT EXISTS widgets (
-    id INTEGER PRIMARY KEY,
-    dashboard_id INTEGER NOT NULL REFERENCES dashboards(id) ON DELETE CASCADE,
-    title TEXT NOT NULL,
-    config TEXT NOT NULL,
-    width TEXT NOT NULL DEFAULT 'third',
-    position INTEGER NOT NULL DEFAULT 0
-);
-
-CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(project_id, status_id, position);
-CREATE INDEX IF NOT EXISTS idx_tasks_assignee ON tasks(assignee_id);
-CREATE INDEX IF NOT EXISTS idx_time_entries_task ON time_entries(task_id);
-CREATE INDEX IF NOT EXISTS idx_time_entries_user_date ON time_entries(user_id, date);
-CREATE INDEX IF NOT EXISTS idx_comments_task ON comments(task_id);
-CREATE INDEX IF NOT EXISTS idx_widgets_dashboard ON widgets(dashboard_id, position);
-`;
+import { MongoClient } from 'mongodb';
 
 /**
- * Brings databases created by older versions up to the current schema.
- * `CREATE TABLE IF NOT EXISTS` doesn't add columns to existing tables.
- *
- * @param {DatabaseSync} db
- * @returns {void}
+ * Collections and the indexes they need. Documents use integer `_id`s
+ * (from the `counters` collection) so URLs and ids stay short and numeric.
  */
-function migrate(db) {
-    const timeEntryColumns = db.prepare('PRAGMA table_info(time_entries)').all().map((column) => column.name);
-
-    if (!timeEntryColumns.includes('start_time')) {
-        db.exec('ALTER TABLE time_entries ADD COLUMN start_time TEXT;');
-        db.exec('ALTER TABLE time_entries ADD COLUMN end_time TEXT;');
-    }
-}
-
-// The ignore hints stop Turbopack tracing the whole project into the build output.
-const DATABASE_FILE = path.resolve(
-    /* turbopackIgnore: true */ process.env.DATABASE_PATH || path.join(/* turbopackIgnore: true */ process.cwd(), 'data', 'pegboards.db')
-);
+const INDEXES = {
+    users: [{ key: { email: 1 }, unique: true }],
+    sessions: [
+        { key: { userId: 1 } },
+        // MongoDB deletes expired sessions automatically.
+        { key: { expiresAt: 1 }, expireAfterSeconds: 0 },
+    ],
+    statuses: [{ key: { projectId: 1, position: 1 } }],
+    tasks: [{ key: { projectId: 1, statusId: 1, position: 1 } }, { key: { assigneeId: 1 } }],
+    timeEntries: [{ key: { taskId: 1 } }, { key: { userId: 1, date: 1 } }],
+    comments: [{ key: { taskId: 1 } }],
+    dashboards: [{ key: { ownerId: 1 } }],
+    widgets: [{ key: { dashboardId: 1, position: 1 } }],
+};
 
 /**
- * Opens (creating if needed) the database file and sets connection options.
- *
- * @returns {DatabaseSync}
+ * @returns {Promise<import('mongodb').Db>}
  */
-function openDatabase() {
-    fs.mkdirSync(path.dirname(DATABASE_FILE), { recursive: true });
+async function connect() {
+    const uri = process.env.MONGODB_URI;
 
-    if (!fs.existsSync(DATABASE_FILE)) {
-        // Leftover journal files from a deleted database would be replayed
-        // into the new file and bring back fragments of the old data.
-        for (const suffix of ['-wal', '-shm']) {
-            fs.rmSync(`${DATABASE_FILE}${suffix}`, { force: true });
-        }
-
-        console.info(`Creating a new database at ${DATABASE_FILE}`);
+    if (!uri) {
+        throw new Error('MONGODB_URI is not set. Add it to .env.local (see .env.example).');
     }
 
-    const db = new DatabaseSync(DATABASE_FILE);
+    const client = new MongoClient(uri);
 
-    db.exec('PRAGMA journal_mode = WAL;');
-    db.exec('PRAGMA foreign_keys = ON;');
-    db.exec('PRAGMA busy_timeout = 5000;');
+    await client.connect();
+
+    const db = client.db(process.env.MONGODB_DB || 'pegboards');
+
+    await Promise.all(
+        Object.entries(INDEXES).map(([name, indexes]) =>
+            db.collection(name).createIndexes(indexes.map((index) => ({ ...index })))
+        )
+    );
 
     return db;
 }
 
-// Module-level on purpose: a hot reload of this file resets it, so schema
-// changes get applied to the connection cached on `globalThis`.
-let schemaReady = false;
-
 /**
- * Returns the shared database connection, with the schema up to date.
- * If the database file has been deleted since it was opened, a fresh one
- * is created in its place.
+ * Returns the shared database handle.
  *
- * The connection is cached on `globalThis` so dev-server hot reloads
- * don't open a new file handle on every edit.
+ * The connection promise is cached on `globalThis` so serverless
+ * invocations and dev-server hot reloads reuse one connection pool. A
+ * failed connection isn't cached, so the next request retries.
  *
- * @returns {DatabaseSync}
+ * @returns {Promise<import('mongodb').Db>}
  */
 export function getDb() {
-    const cached = globalThis.__pegboardsDb;
-
-    // Never swap connections mid-transaction; the check runs again on the next call.
-    if (cached && !cached.isTransaction && !fs.existsSync(DATABASE_FILE)) {
-        console.warn(`Database file ${DATABASE_FILE} went missing; starting a new one.`);
-        cached.close();
-        globalThis.__pegboardsDb = null;
-    }
-
     if (!globalThis.__pegboardsDb) {
-        globalThis.__pegboardsDb = openDatabase();
-        schemaReady = false;
+        globalThis.__pegboardsDb = connect().catch((error) => {
+            globalThis.__pegboardsDb = null;
+            throw error;
+        });
     }
 
-    const db = globalThis.__pegboardsDb;
-
-    if (!schemaReady) {
-        db.exec(SCHEMA);
-        migrate(db);
-        schemaReady = true;
-    }
-
-    return db;
+    return globalThis.__pegboardsDb;
 }
 
 /**
- * Runs `callback` inside a transaction, rolling back if it throws.
- * Nested calls join the outer transaction.
+ * Shortcut for `(await getDb()).collection(name)`.
  *
- * @template T
- * @param {() => T} callback
- * @returns {T}
+ * @param {string} name
+ * @returns {Promise<import('mongodb').Collection>}
  */
-export function transaction(callback) {
-    const db = getDb();
+export async function collection(name) {
+    return (await getDb()).collection(name);
+}
 
-    if (db.isTransaction) {
-        return callback();
+/**
+ * Reserves the next integer id for a collection.
+ *
+ * @param {string} name - Collection name.
+ * @returns {Promise<number>}
+ */
+export async function nextId(name) {
+    const [id] = await reserveIds(name, 1);
+
+    return id;
+}
+
+/**
+ * Reserves `count` consecutive integer ids in one round trip, for bulk inserts.
+ *
+ * @param {string} name - Collection name.
+ * @param {number} count
+ * @returns {Promise<number[]>}
+ */
+export async function reserveIds(name, count) {
+    const counters = await collection('counters');
+    const counter = await counters.findOneAndUpdate(
+        { _id: name },
+        { $inc: { seq: count } },
+        { upsert: true, returnDocument: 'after' }
+    );
+    const first = counter.seq - count + 1;
+
+    return Array.from({ length: count }, (_, index) => first + index);
+}
+
+/**
+ * Inserts a document with a fresh integer id.
+ *
+ * @param {string} name - Collection name.
+ * @param {Object} document - Without `_id`.
+ * @returns {Promise<number>} The new id.
+ */
+export async function insertWithId(name, document) {
+    const id = await nextId(name);
+
+    await (await collection(name)).insertOne({ _id: id, ...document });
+
+    return id;
+}
+
+/**
+ * Rewrites `position` so documents are numbered 0..n in the given order.
+ *
+ * @param {string} name - Collection name.
+ * @param {number[]} ids - Document ids in their new order.
+ * @param {Object} [extra] - Extra fields to set on every document.
+ * @returns {Promise<void>}
+ */
+export async function setPositions(name, ids, extra = {}) {
+    if (ids.length === 0) {
+        return;
     }
 
-    db.exec('BEGIN');
+    await (await collection(name)).bulkWrite(
+        ids.map((id, position) => ({
+            updateOne: { filter: { _id: id }, update: { $set: { ...extra, position } } },
+        }))
+    );
+}
 
-    try {
-        const result = callback();
-        db.exec('COMMIT');
-        return result;
-    } catch (error) {
-        db.exec('ROLLBACK');
-        throw error;
-    }
+/**
+ * Next.js page props must be plain JSON, so Dates become ISO strings.
+ *
+ * @param {Date|null|undefined} value
+ * @returns {string|null}
+ */
+export function toISO(value) {
+    return value ? value.toISOString() : null;
 }

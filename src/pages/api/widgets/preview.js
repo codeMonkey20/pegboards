@@ -7,10 +7,10 @@ import * as validate from '@/server/validation';
  * Computes a widget's data without saving it, for the live preview in the editor.
  */
 export default apiHandler({
-    POST(req, res) {
-        const user = requireUser(req);
+    async POST(req, res) {
+        const user = await requireUser(req);
         const data = validate.body(req);
 
-        res.status(200).json(computeMetric(validateWidgetConfig(data.config), user.id));
+        res.status(200).json(await computeMetric(validateWidgetConfig(data.config), user.id));
     },
 });

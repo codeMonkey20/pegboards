@@ -94,13 +94,13 @@ export function formatDate(value) {
 }
 
 /**
- * Formats a SQLite UTC timestamp (`YYYY-MM-DD HH:MM:SS`) in local time.
+ * Formats an ISO timestamp in local time.
  *
  * @param {string} value
  * @returns {string}
  */
 export function formatTimestamp(value) {
-    const date = new Date(`${value.replace(' ', 'T')}Z`);
+    const date = new Date(value);
 
     return date.toLocaleString('en-US', {
         month: 'short',

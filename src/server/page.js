@@ -1,5 +1,5 @@
 import { getSessionUser, needsSetup } from './auth';
-import { getDb } from './db';
+import { collection } from './db';
 
 /**
  * @typedef {Object} NavData
@@ -7,27 +7,31 @@ import { getDb } from './db';
  * @property {{ id: number, name: string }[]} dashboards
  */
 
+const BY_NAME = { locale: 'en', strength: 2 };
+
 /**
  * Loads the sidebar lists shown on every signed-in page.
  *
  * @param {number} userId
- * @returns {NavData}
+ * @returns {Promise<NavData>}
  */
-function getNavData(userId) {
-    const db = getDb();
-
-    const projects = db.prepare('SELECT id, name, color FROM projects ORDER BY name COLLATE NOCASE').all();
-    const dashboards = db
-        .prepare(
-            `SELECT id, name FROM dashboards
-             WHERE owner_id = ? OR is_shared = 1
-             ORDER BY name COLLATE NOCASE`
-        )
-        .all(userId);
+async function getNavData(userId) {
+    const [projects, dashboards] = await Promise.all([
+        (await collection('projects'))
+            .find({}, { projection: { name: 1, color: 1 } })
+            .collation(BY_NAME)
+            .sort({ name: 1 })
+            .toArray(),
+        (await collection('dashboards'))
+            .find({ $or: [{ ownerId: userId }, { isShared: true }] }, { projection: { name: 1 } })
+            .collation(BY_NAME)
+            .sort({ name: 1 })
+            .toArray(),
+    ]);
 
     return {
-        projects: projects.map((row) => ({ ...row })),
-        dashboards: dashboards.map((row) => ({ ...row })),
+        projects: projects.map((doc) => ({ id: doc._id, name: doc.name, color: doc.color })),
+        dashboards: dashboards.map((doc) => ({ id: doc._id, name: doc.name })),
     };
 }
 
@@ -42,10 +46,10 @@ function getNavData(userId) {
  */
 export function withPageAuth(getProps) {
     return async function getServerSideProps(context) {
-        const user = getSessionUser(context.req);
+        const user = await getSessionUser(context.req);
 
         if (!user) {
-            const destination = needsSetup()
+            const destination = (await needsSetup())
                 ? '/setup'
                 : `/login?next=${encodeURIComponent(context.resolvedUrl)}`;
 
@@ -63,7 +67,7 @@ export function withPageAuth(getProps) {
             props: {
                 ...result.props,
                 currentUser: user,
-                nav: getNavData(user.id),
+                nav: await getNavData(user.id),
             },
         };
     };

@@ -1,7 +1,7 @@
 import { PRIORITY_VALUES } from '@/lib/constants';
 import { formatTime } from '@/lib/format';
 
-import { getDb, transaction } from './db';
+import { collection, insertWithId, setPositions, toISO } from './db';
 import { HttpError } from './http';
 import { requireStatus } from './projects';
 import * as validate from './validation';
@@ -19,7 +19,7 @@ import * as validate from './validation';
  * @property {number} position
  * @property {number} hoursLogged
  * @property {number} commentCount
- * @property {string|null} completedAt
+ * @property {string|null} completedAt - ISO timestamp.
  */
 
 /**
@@ -28,7 +28,7 @@ import * as validate from './validation';
  * @property {number|null} userId
  * @property {string} userName
  * @property {string} body
- * @property {string} createdAt
+ * @property {string} createdAt - ISO timestamp.
  */
 
 /**
@@ -53,19 +53,14 @@ import * as validate from './validation';
  * }} TaskDetail
  */
 
-const SUMMARY_SELECT = `
-    SELECT t.*,
-           (SELECT COALESCE(SUM(hours), 0) FROM time_entries WHERE task_id = t.id) AS hours_logged,
-           (SELECT COUNT(*) FROM comments WHERE task_id = t.id) AS comment_count
-    FROM tasks t
-`;
+const PRIORITY_RANK = Object.fromEntries(PRIORITY_VALUES.map((value, index) => [value, index]));
 
 /**
  * Validates the editable task fields present in a request body.
  * Fields that weren't sent are left undefined so updates skip them.
  *
  * @param {Record<string, unknown>} data
- * @returns {{
+ * @returns {Promise<{
  *   title?: string,
  *   description?: string,
  *   priority?: import('@/lib/constants').Priority,
@@ -73,9 +68,9 @@ const SUMMARY_SELECT = `
  *   dueDate?: string|null,
  *   estimateHours?: number|null,
  *   statusId?: number,
- * }}
+ * }>}
  */
-export function parseTaskInput(data) {
+export async function parseTaskInput(data) {
     const input = {};
 
     if (validate.has(data, 'title')) {
@@ -94,9 +89,7 @@ export function parseTaskInput(data) {
         input.assigneeId = validate.id(data.assigneeId, 'Assignee', { nullable: true });
 
         if (input.assigneeId !== null) {
-            const assignee = getDb()
-                .prepare('SELECT id FROM users WHERE id = ? AND is_active = 1')
-                .get(input.assigneeId);
+            const assignee = await (await collection('users')).findOne({ _id: input.assigneeId, isActive: true });
 
             if (!assignee) {
                 throw new HttpError(400, 'Assignee is not an active user');
@@ -120,119 +113,138 @@ export function parseTaskInput(data) {
 }
 
 /**
- * @param {Object} row
- * @returns {TaskSummary}
+ * Adds logged hours and comment counts to task documents.
+ *
+ * @param {Object[]} docs
+ * @returns {Promise<TaskSummary[]>}
  */
-function toTaskSummary(row) {
-    return {
-        id: row.id,
-        projectId: row.project_id,
-        statusId: row.status_id,
-        title: row.title,
-        priority: row.priority,
-        assigneeId: row.assignee_id,
-        dueDate: row.due_date,
-        estimateHours: row.estimate_hours,
-        position: row.position,
-        hoursLogged: row.hours_logged,
-        commentCount: row.comment_count,
-        completedAt: row.completed_at,
-    };
-}
+async function toTaskSummaries(docs) {
+    const ids = docs.map((doc) => doc._id);
+    const [hours, comments] = await Promise.all([
+        (await collection('timeEntries'))
+            .aggregate([{ $match: { taskId: { $in: ids } } }, { $group: { _id: '$taskId', total: { $sum: '$hours' } } }])
+            .toArray(),
+        (await collection('comments'))
+            .aggregate([{ $match: { taskId: { $in: ids } } }, { $group: { _id: '$taskId', total: { $sum: 1 } } }])
+            .toArray(),
+    ]);
+    const hoursById = new Map(hours.map((row) => [row._id, Math.round(row.total * 100) / 100]));
+    const commentsById = new Map(comments.map((row) => [row._id, row.total]));
 
-/**
- * @param {number} projectId
- * @returns {TaskSummary[]}
- */
-export function listBoardTasks(projectId) {
-    return getDb()
-        .prepare(`${SUMMARY_SELECT} WHERE t.project_id = ? ORDER BY t.position, t.id`)
-        .all(projectId)
-        .map(toTaskSummary);
+    return docs.map((doc) => ({
+        id: doc._id,
+        projectId: doc.projectId,
+        statusId: doc.statusId,
+        title: doc.title,
+        priority: doc.priority,
+        assigneeId: doc.assigneeId,
+        dueDate: doc.dueDate,
+        estimateHours: doc.estimateHours,
+        position: doc.position,
+        hoursLogged: hoursById.get(doc._id) ?? 0,
+        commentCount: commentsById.get(doc._id) ?? 0,
+        completedAt: toISO(doc.completedAt),
+    }));
 }
 
 /**
  * @param {number} id
- * @returns {TaskSummary}
+ * @returns {Promise<Object>} The raw task document.
  */
-export function getTaskSummary(id) {
-    const row = getDb().prepare(`${SUMMARY_SELECT} WHERE t.id = ?`).get(id);
+async function requireTaskDoc(id) {
+    const doc = await (await collection('tasks')).findOne({ _id: id });
 
-    if (!row) {
+    if (!doc) {
         throw new HttpError(404, 'Task not found');
     }
 
-    return toTaskSummary(row);
+    return doc;
+}
+
+/**
+ * @param {number[]} ids
+ * @returns {Promise<Map<number, string>>} User id to name.
+ */
+async function userNames(ids) {
+    const users = await (await collection('users'))
+        .find({ _id: { $in: [...new Set(ids)] } }, { projection: { name: 1 } })
+        .toArray();
+
+    return new Map(users.map((user) => [user._id, user.name]));
+}
+
+/**
+ * @param {number} projectId
+ * @returns {Promise<TaskSummary[]>}
+ */
+export async function listBoardTasks(projectId) {
+    const docs = await (await collection('tasks')).find({ projectId }).sort({ position: 1, _id: 1 }).toArray();
+
+    return toTaskSummaries(docs);
+}
+
+/**
+ * @param {number} id
+ * @returns {Promise<TaskSummary>}
+ */
+export async function getTaskSummary(id) {
+    const [summary] = await toTaskSummaries([await requireTaskDoc(id)]);
+
+    return summary;
 }
 
 /**
  * Loads a task with its comments and time entries.
  *
  * @param {number} id
- * @returns {TaskDetail}
+ * @returns {Promise<TaskDetail>}
  */
-export function getTaskDetail(id) {
-    const db = getDb();
-    const summary = getTaskSummary(id);
-    const row = db
-        .prepare(
-            `SELECT t.description, t.created_at, u.name AS creator_name
-             FROM tasks t LEFT JOIN users u ON u.id = t.creator_id
-             WHERE t.id = ?`
-        )
-        .get(id);
-
-    const comments = db
-        .prepare(
-            `SELECT c.id, c.user_id, c.body, c.created_at, COALESCE(u.name, 'Deleted user') AS user_name
-             FROM comments c LEFT JOIN users u ON u.id = c.user_id
-             WHERE c.task_id = ? ORDER BY c.created_at, c.id`
-        )
-        .all(id)
-        .map((comment) => ({
-            id: comment.id,
-            userId: comment.user_id,
-            userName: comment.user_name,
-            body: comment.body,
-            createdAt: comment.created_at,
-        }));
-
-    const timeEntries = db
-        .prepare(
-            `SELECT te.id, te.user_id, te.hours, te.note, te.date, te.start_time, te.end_time, u.name AS user_name
-             FROM time_entries te JOIN users u ON u.id = te.user_id
-             WHERE te.task_id = ? ORDER BY te.date DESC, te.start_time DESC, te.id DESC`
-        )
-        .all(id)
-        .map((entry) => ({
-            id: entry.id,
-            userId: entry.user_id,
-            userName: entry.user_name,
-            hours: entry.hours,
-            note: entry.note,
-            date: entry.date,
-            startTime: entry.start_time,
-            endTime: entry.end_time,
-        }));
+export async function getTaskDetail(id) {
+    const doc = await requireTaskDoc(id);
+    const [[summary], comments, timeEntries] = await Promise.all([
+        toTaskSummaries([doc]),
+        (await collection('comments')).find({ taskId: id }).sort({ createdAt: 1, _id: 1 }).toArray(),
+        (await collection('timeEntries')).find({ taskId: id }).sort({ date: -1, startTime: -1, _id: -1 }).toArray(),
+    ]);
+    const names = await userNames([
+        doc.creatorId,
+        ...comments.map((comment) => comment.userId),
+        ...timeEntries.map((entry) => entry.userId),
+    ]);
 
     return {
         ...summary,
-        description: row.description,
-        creatorName: row.creator_name,
-        createdAt: row.created_at,
-        comments,
-        timeEntries,
+        description: doc.description,
+        creatorName: names.get(doc.creatorId) ?? null,
+        createdAt: toISO(doc.createdAt),
+        comments: comments.map((comment) => ({
+            id: comment._id,
+            userId: comment.userId,
+            userName: names.get(comment.userId) ?? 'Deleted user',
+            body: comment.body,
+            createdAt: toISO(comment.createdAt),
+        })),
+        timeEntries: timeEntries.map((entry) => ({
+            id: entry._id,
+            userId: entry.userId,
+            userName: names.get(entry.userId) ?? 'Deleted user',
+            hours: entry.hours,
+            note: entry.note,
+            date: entry.date,
+            startTime: entry.startTime ?? null,
+            endTime: entry.endTime ?? null,
+        })),
     };
 }
 
 /**
  * @param {number} statusId
- * @returns {number}
+ * @returns {Promise<number>}
  */
-function nextPosition(statusId) {
-    return getDb()
-        .prepare('SELECT COALESCE(MAX(position), -1) + 1 AS next FROM tasks WHERE status_id = ?')
-        .get(statusId).next;
+async function nextPosition(statusId) {
+    const last = await (await collection('tasks')).findOne({ statusId }, { sort: { position: -1 } });
+
+    return last ? last.position + 1 : 0;
 }
 
 /**
@@ -247,9 +259,9 @@ function nextPosition(statusId) {
  * @param {number|null} [data.assigneeId]
  * @param {string|null} [data.dueDate]
  * @param {number|null} [data.estimateHours]
- * @returns {TaskSummary}
+ * @returns {Promise<TaskSummary>}
  */
-export function createTask({
+export async function createTask({
     statusId,
     title,
     creatorId,
@@ -259,50 +271,43 @@ export function createTask({
     dueDate = null,
     estimateHours = null,
 }) {
-    const status = requireStatus(statusId);
-    const result = getDb()
-        .prepare(
-            `INSERT INTO tasks
-                (project_id, status_id, title, description, priority, assignee_id, creator_id,
-                 due_date, estimate_hours, position, completed_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CASE WHEN ? THEN datetime('now') END)`
-        )
-        .run(
-            status.projectId,
-            statusId,
-            title,
-            description,
-            priority,
-            assigneeId,
-            creatorId,
-            dueDate,
-            estimateHours,
-            nextPosition(statusId),
-            status.isDone ? 1 : 0
-        );
+    const status = await requireStatus(statusId);
+    const now = new Date();
+    const id = await insertWithId('tasks', {
+        projectId: status.projectId,
+        statusId,
+        title,
+        description,
+        priority,
+        assigneeId,
+        creatorId,
+        dueDate,
+        estimateHours,
+        position: await nextPosition(statusId),
+        createdAt: now,
+        updatedAt: now,
+        completedAt: status.isDone ? now : null,
+    });
 
-    return getTaskSummary(Number(result.lastInsertRowid));
+    return getTaskSummary(id);
 }
 
 /**
- * Keeps `completed_at` in sync when a task changes column.
+ * Keeps `completedAt` in sync when a task changes column.
  *
  * @param {number} taskId
  * @param {number} statusId
- * @returns {void}
+ * @returns {Promise<void>}
  */
-function syncCompletion(taskId, statusId) {
-    const status = requireStatus(statusId);
+async function syncCompletion(taskId, statusId) {
+    const status = await requireStatus(statusId);
+    const tasks = await collection('tasks');
 
-    getDb()
-        .prepare(
-            `UPDATE tasks SET completed_at = CASE
-                WHEN ? THEN COALESCE(completed_at, datetime('now'))
-                ELSE NULL
-             END
-             WHERE id = ?`
-        )
-        .run(status.isDone ? 1 : 0, taskId);
+    if (status.isDone) {
+        await tasks.updateOne({ _id: taskId, completedAt: null }, { $set: { completedAt: new Date() } });
+    } else {
+        await tasks.updateOne({ _id: taskId }, { $set: { completedAt: null } });
+    }
 }
 
 /**
@@ -318,51 +323,39 @@ function syncCompletion(taskId, statusId) {
  * @param {string|null} [changes.dueDate]
  * @param {number|null} [changes.estimateHours]
  * @param {number} [changes.statusId]
- * @returns {TaskSummary}
+ * @returns {Promise<TaskSummary>}
  */
-export function updateTask(id, changes) {
-    return transaction(() => {
-        const task = getTaskSummary(id);
-        const columns = [];
-        const values = [];
-        const mapping = {
-            title: 'title',
-            description: 'description',
-            priority: 'priority',
-            assigneeId: 'assignee_id',
-            dueDate: 'due_date',
-            estimateHours: 'estimate_hours',
-        };
+export async function updateTask(id, changes) {
+    const task = await requireTaskDoc(id);
+    const update = {};
 
-        for (const [key, column] of Object.entries(mapping)) {
-            if (changes[key] !== undefined) {
-                columns.push(`${column} = ?`);
-                values.push(changes[key]);
-            }
+    for (const key of ['title', 'description', 'priority', 'assigneeId', 'dueDate', 'estimateHours']) {
+        if (changes[key] !== undefined) {
+            update[key] = changes[key];
+        }
+    }
+
+    if (changes.statusId !== undefined && changes.statusId !== task.statusId) {
+        const status = await requireStatus(changes.statusId);
+
+        if (status.projectId !== task.projectId) {
+            throw new HttpError(400, 'That column belongs to another board');
         }
 
-        if (changes.statusId !== undefined && changes.statusId !== task.statusId) {
-            const status = requireStatus(changes.statusId);
+        update.statusId = changes.statusId;
+        update.position = await nextPosition(changes.statusId);
+    }
 
-            if (status.projectId !== task.projectId) {
-                throw new HttpError(400, 'That column belongs to another board');
-            }
+    if (Object.keys(update).length > 0) {
+        update.updatedAt = new Date();
+        await (await collection('tasks')).updateOne({ _id: id }, { $set: update });
+    }
 
-            columns.push('status_id = ?', 'position = ?');
-            values.push(changes.statusId, nextPosition(changes.statusId));
-        }
+    if (changes.statusId !== undefined) {
+        await syncCompletion(id, changes.statusId);
+    }
 
-        if (columns.length > 0) {
-            columns.push("updated_at = datetime('now')");
-            getDb().prepare(`UPDATE tasks SET ${columns.join(', ')} WHERE id = ?`).run(...values, id);
-        }
-
-        if (changes.statusId !== undefined) {
-            syncCompletion(id, changes.statusId);
-        }
-
-        return getTaskSummary(id);
-    });
+    return getTaskSummary(id);
 }
 
 /**
@@ -371,52 +364,52 @@ export function updateTask(id, changes) {
  * @param {number} id
  * @param {number} statusId
  * @param {number} index
- * @returns {TaskSummary}
+ * @returns {Promise<TaskSummary>}
  */
-export function moveTask(id, statusId, index) {
-    return transaction(() => {
-        const db = getDb();
-        const task = getTaskSummary(id);
-        const status = requireStatus(statusId);
+export async function moveTask(id, statusId, index) {
+    const task = await requireTaskDoc(id);
+    const status = await requireStatus(statusId);
 
-        if (status.projectId !== task.projectId) {
-            throw new HttpError(400, 'That column belongs to another board');
-        }
+    if (status.projectId !== task.projectId) {
+        throw new HttpError(400, 'That column belongs to another board');
+    }
 
-        const siblings = db
-            .prepare('SELECT id FROM tasks WHERE status_id = ? AND id != ? ORDER BY position, id')
-            .all(statusId, id)
-            .map((row) => row.id);
-        const clampedIndex = Math.max(0, Math.min(index, siblings.length));
+    const tasks = await collection('tasks');
+    const siblings = await tasks.find({ statusId, _id: { $ne: id } }).sort({ position: 1, _id: 1 }).toArray();
+    const ordered = siblings.map((doc) => doc._id);
 
-        siblings.splice(clampedIndex, 0, id);
+    ordered.splice(Math.max(0, Math.min(index, ordered.length)), 0, id);
 
-        const update = db.prepare("UPDATE tasks SET status_id = ?, position = ?, updated_at = datetime('now') WHERE id = ?");
-        siblings.forEach((taskId, position) => update.run(statusId, position, taskId));
+    await setPositions('tasks', ordered, { statusId });
+    await tasks.updateOne({ _id: id }, { $set: { updatedAt: new Date() } });
+    await syncCompletion(id, statusId);
 
-        syncCompletion(id, statusId);
-
-        return getTaskSummary(id);
-    });
+    return getTaskSummary(id);
 }
 
 /**
+ * Deletes a task with its comments and time entries.
+ *
  * @param {number} id
- * @returns {void}
+ * @returns {Promise<void>}
  */
-export function deleteTask(id) {
-    getDb().prepare('DELETE FROM tasks WHERE id = ?').run(id);
+export async function deleteTask(id) {
+    await Promise.all([
+        (await collection('timeEntries')).deleteMany({ taskId: id }),
+        (await collection('comments')).deleteMany({ taskId: id }),
+    ]);
+    await (await collection('tasks')).deleteOne({ _id: id });
 }
 
 /**
  * @param {number} taskId
  * @param {number} userId
  * @param {string} body
- * @returns {void}
+ * @returns {Promise<void>}
  */
-export function addComment(taskId, userId, body) {
-    getTaskSummary(taskId);
-    getDb().prepare('INSERT INTO comments (task_id, user_id, body) VALUES (?, ?, ?)').run(taskId, userId, body);
+export async function addComment(taskId, userId, body) {
+    await requireTaskDoc(taskId);
+    await insertWithId('comments', { taskId, userId, body, createdAt: new Date() });
 }
 
 /**
@@ -432,40 +425,38 @@ export function addComment(taskId, userId, body) {
  * @param {string} data.note
  * @param {string|null} [data.startTime] - `HH:MM`
  * @param {string|null} [data.endTime] - `HH:MM`, after `startTime`.
- * @returns {void}
+ * @returns {Promise<void>}
  */
-export function addTimeEntry(taskId, { userId, hours, date, note, startTime = null, endTime = null }) {
-    transaction(() => {
-        const db = getDb();
+export async function addTimeEntry(taskId, { userId, hours, date, note, startTime = null, endTime = null }) {
+    await requireTaskDoc(taskId);
 
-        getTaskSummary(taskId);
+    if (startTime && endTime) {
+        // Zero-padded HH:MM strings compare correctly as text.
+        const conflict = await (await collection('timeEntries')).findOne(
+            { userId, date, startTime: { $ne: null, $lt: endTime }, endTime: { $gt: startTime } },
+            { sort: { startTime: 1 } }
+        );
 
-        if (startTime && endTime) {
-            // Zero-padded HH:MM strings compare correctly as text.
-            const conflict = db
-                .prepare(
-                    `SELECT te.start_time, te.end_time, t.title
-                     FROM time_entries te JOIN tasks t ON t.id = te.task_id
-                     WHERE te.user_id = ? AND te.date = ?
-                       AND te.start_time IS NOT NULL
-                       AND te.start_time < ? AND te.end_time > ?
-                     ORDER BY te.start_time
-                     LIMIT 1`
-                )
-                .get(userId, date, endTime, startTime);
+        if (conflict) {
+            const conflictTask = await (await collection('tasks')).findOne({ _id: conflict.taskId });
 
-            if (conflict) {
-                throw new HttpError(
-                    409,
-                    `That overlaps time you already logged on “${conflict.title}” ` +
-                        `(${formatTime(conflict.start_time)}–${formatTime(conflict.end_time)})`
-                );
-            }
+            throw new HttpError(
+                409,
+                `That overlaps time you already logged on “${conflictTask?.title ?? 'another task'}” ` +
+                    `(${formatTime(conflict.startTime)}–${formatTime(conflict.endTime)})`
+            );
         }
+    }
 
-        db.prepare(
-            'INSERT INTO time_entries (task_id, user_id, hours, date, note, start_time, end_time) VALUES (?, ?, ?, ?, ?, ?, ?)'
-        ).run(taskId, userId, hours, date, note, startTime, endTime);
+    await insertWithId('timeEntries', {
+        taskId,
+        userId,
+        hours,
+        date,
+        note,
+        startTime,
+        endTime,
+        createdAt: new Date(),
     });
 }
 
@@ -474,51 +465,67 @@ export function addTimeEntry(taskId, { userId, hours, date, note, startTime = nu
  *
  * @param {number} id
  * @param {import('./auth').SessionUser} user
- * @returns {number} The task id the entry belonged to.
+ * @returns {Promise<number>} The task id the entry belonged to.
  */
-export function deleteTimeEntry(id, user) {
-    const db = getDb();
-    const entry = db.prepare('SELECT task_id, user_id FROM time_entries WHERE id = ?').get(id);
+export async function deleteTimeEntry(id, user) {
+    const timeEntries = await collection('timeEntries');
+    const entry = await timeEntries.findOne({ _id: id });
 
     if (!entry) {
         throw new HttpError(404, 'Time entry not found');
     }
 
-    if (entry.user_id !== user.id && user.role !== 'admin') {
+    if (entry.userId !== user.id && user.role !== 'admin') {
         throw new HttpError(403, 'You can only remove your own time');
     }
 
-    db.prepare('DELETE FROM time_entries WHERE id = ?').run(id);
+    await timeEntries.deleteOne({ _id: id });
 
-    return entry.task_id;
+    return entry.taskId;
+}
+
+/**
+ * Sorts tasks by due date (undated last), then by priority.
+ *
+ * @param {TaskSummary} a
+ * @param {TaskSummary} b
+ * @returns {number}
+ */
+function compareByDueThenPriority(a, b) {
+    if (a.dueDate === b.dueDate) {
+        return PRIORITY_RANK[a.priority] - PRIORITY_RANK[b.priority];
+    }
+
+    if (!a.dueDate || !b.dueDate) {
+        return a.dueDate ? -1 : 1;
+    }
+
+    return a.dueDate < b.dueDate ? -1 : 1;
 }
 
 /**
  * Open tasks assigned to a user, soonest due first, with board info.
  *
  * @param {number} userId
- * @returns {(TaskSummary & { projectName: string, projectColor: string, statusName: string, statusColor: string })[]}
+ * @returns {Promise<(TaskSummary & { projectName: string, projectColor: string, statusName: string, statusColor: string })[]>}
  */
-export function listAssignedTasks(userId) {
-    return getDb()
-        .prepare(
-            `SELECT t.*, p.name AS project_name, p.color AS project_color,
-                    s.name AS status_name, s.color AS status_color,
-                    (SELECT COALESCE(SUM(hours), 0) FROM time_entries WHERE task_id = t.id) AS hours_logged,
-                    (SELECT COUNT(*) FROM comments WHERE task_id = t.id) AS comment_count
-             FROM tasks t
-             JOIN projects p ON p.id = t.project_id
-             JOIN statuses s ON s.id = t.status_id
-             WHERE t.assignee_id = ? AND t.completed_at IS NULL
-             ORDER BY t.due_date IS NULL, t.due_date,
-                      CASE t.priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 ELSE 3 END`
-        )
-        .all(userId)
-        .map((row) => ({
-            ...toTaskSummary(row),
-            projectName: row.project_name,
-            projectColor: row.project_color,
-            statusName: row.status_name,
-            statusColor: row.status_color,
-        }));
+export async function listAssignedTasks(userId) {
+    const docs = await (await collection('tasks')).find({ assigneeId: userId, completedAt: null }).toArray();
+    const [summaries, projects, statuses] = await Promise.all([
+        toTaskSummaries(docs),
+        (await collection('projects')).find({ _id: { $in: docs.map((doc) => doc.projectId) } }).toArray(),
+        (await collection('statuses')).find({ _id: { $in: docs.map((doc) => doc.statusId) } }).toArray(),
+    ]);
+    const projectsById = new Map(projects.map((project) => [project._id, project]));
+    const statusesById = new Map(statuses.map((status) => [status._id, status]));
+
+    return summaries
+        .map((task) => ({
+            ...task,
+            projectName: projectsById.get(task.projectId)?.name ?? '',
+            projectColor: projectsById.get(task.projectId)?.color ?? '#898781',
+            statusName: statusesById.get(task.statusId)?.name ?? '',
+            statusColor: statusesById.get(task.statusId)?.color ?? '#898781',
+        }))
+        .sort(compareByDueThenPriority);
 }
