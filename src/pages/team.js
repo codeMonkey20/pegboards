@@ -7,6 +7,7 @@ import ColorPicker from '@/components/ui/ColorPicker';
 import { ErrorMessage, Field, Input, Select } from '@/components/ui/Field';
 import Modal from '@/components/ui/Modal';
 import { api } from '@/lib/api';
+import { useBusy } from '@/lib/useBusy';
 import { withPageAuth } from '@/server/page';
 import { listUsers } from '@/server/users';
 
@@ -24,12 +25,11 @@ import { listUsers } from '@/server/users';
 function UserModal({ user, isAdmin, isSelf, onClose, onSaved }) {
     const [color, setColor] = useState(user?.color ?? '#2a78d6');
     const [error, setError] = useState(null);
-    const [saving, setSaving] = useState(false);
+    const { run, isBusy } = useBusy();
+    const saving = isBusy('save');
 
-    async function handleSubmit(event) {
+    function handleSubmit(event) {
         event.preventDefault();
-        setError(null);
-        setSaving(true);
 
         const form = new FormData(event.currentTarget);
         const body = { name: form.get('name'), email: form.get('email') };
@@ -43,15 +43,18 @@ function UserModal({ user, isAdmin, isSelf, onClose, onSaved }) {
             body.role = form.get('role');
         }
 
-        try {
-            const saved = user
-                ? await api(`/api/users/${user.id}`, { method: 'PATCH', body: { ...body, color } })
-                : await api('/api/users', { method: 'POST', body });
-            onSaved(saved);
-        } catch (requestError) {
-            setError(requestError.message);
-            setSaving(false);
-        }
+        run('save', async () => {
+            setError(null);
+
+            try {
+                const saved = user
+                    ? await api(`/api/users/${user.id}`, { method: 'PATCH', body: { ...body, color } })
+                    : await api('/api/users', { method: 'POST', body });
+                onSaved(saved);
+            } catch (requestError) {
+                setError(requestError.message);
+            }
+        });
     }
 
     return (
@@ -81,8 +84,8 @@ function UserModal({ user, isAdmin, isSelf, onClose, onSaved }) {
                 {user && <ColorPicker name="user-color" label="Avatar color" value={color} onChange={setColor} />}
                 <ErrorMessage message={error} />
                 <div className="flex justify-end gap-2">
-                    <Button onClick={onClose}>Cancel</Button>
-                    <Button type="submit" variant="primary" disabled={saving}>
+                    <Button onClick={onClose} disabled={saving}>Cancel</Button>
+                    <Button type="submit" variant="primary" loading={saving}>
                         {saving ? 'Saving…' : user ? 'Save' : 'Add teammate'}
                     </Button>
                 </div>
@@ -105,6 +108,7 @@ export default function TeamPage({ users: initialUsers, currentUser, nav }) {
     // null = closed, 'new' = adding, a user = editing them.
     const [editing, setEditing] = useState(null);
     const [error, setError] = useState(null);
+    const { run, isBusy } = useBusy();
     const isAdmin = currentUser.role === 'admin';
 
     function handleSaved(saved) {
@@ -116,19 +120,22 @@ export default function TeamPage({ users: initialUsers, currentUser, nav }) {
         setEditing(null);
     }
 
-    async function toggleActive(user) {
+    function toggleActive(user) {
         const verb = user.isActive ? 'Deactivate' : 'Reactivate';
 
         if (user.isActive && !window.confirm(`${verb} ${user.name}? They'll be signed out and can't sign in. Their tasks and time stay.`)) {
             return;
         }
 
-        try {
+        run(user.id, async () => {
             setError(null);
-            handleSaved(await api(`/api/users/${user.id}`, { method: 'PATCH', body: { isActive: !user.isActive } }));
-        } catch (requestError) {
-            setError(requestError.message);
-        }
+
+            try {
+                handleSaved(await api(`/api/users/${user.id}`, { method: 'PATCH', body: { isActive: !user.isActive } }));
+            } catch (requestError) {
+                setError(requestError.message);
+            }
+        });
     }
 
     return (
@@ -154,6 +161,7 @@ export default function TeamPage({ users: initialUsers, currentUser, nav }) {
                     <tbody className="divide-y divide-zinc-100 dark:divide-zinc-800">
                         {users.map((user) => {
                             const isSelf = user.id === currentUser.id;
+                            const isToggling = isBusy(user.id);
 
                             return (
                                 <tr key={user.id} className={user.isActive ? '' : 'text-zinc-400 dark:text-zinc-500'}>
@@ -169,13 +177,14 @@ export default function TeamPage({ users: initialUsers, currentUser, nav }) {
                                     <td className="px-4 py-2.5 capitalize">{user.role}</td>
                                     <td className="px-4 py-2.5 text-right whitespace-nowrap">
                                         {(isAdmin || isSelf) && (
-                                            <Button size="sm" variant="ghost" onClick={() => setEditing(user)}>
+                                            <Button size="sm" variant="ghost" onClick={() => setEditing(user)} disabled={isToggling}>
                                                 Edit<span className="sr-only"> {user.name}</span>
                                             </Button>
                                         )}
                                         {isAdmin && !isSelf && (
-                                            <Button size="sm" variant="ghost" onClick={() => toggleActive(user)}>
-                                                {user.isActive ? 'Deactivate' : 'Reactivate'}
+                                            <Button size="sm" variant="ghost" onClick={() => toggleActive(user)} loading={isToggling}>
+                                                {isToggling && (user.isActive ? 'Deactivating…' : 'Reactivating…')}
+                                                {!isToggling && (user.isActive ? 'Deactivate' : 'Reactivate')}
                                                 <span className="sr-only"> {user.name}</span>
                                             </Button>
                                         )}

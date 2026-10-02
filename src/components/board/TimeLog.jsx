@@ -2,9 +2,11 @@ import { useState } from 'react';
 
 import Button from '@/components/ui/Button';
 import { ErrorMessage, Field, Input } from '@/components/ui/Field';
+import Spinner from '@/components/ui/Spinner';
 import { today } from '@/lib/dates';
 import { parseDuration, rangeHours } from '@/lib/duration';
 import { formatDate, formatHours, formatHoursMinutes, formatTime } from '@/lib/format';
+import { useBusy } from '@/lib/useBusy';
 
 const MODES = [
     { value: 'duration', label: 'Duration' },
@@ -40,7 +42,8 @@ export default function TimeLog({ task, currentUser, onAdd, onDelete }) {
     const [date, setDate] = useState(today);
     const [note, setNote] = useState('');
     const [error, setError] = useState(null);
-    const [saving, setSaving] = useState(false);
+    const { run, isBusy } = useBusy();
+    const saving = isBusy('add');
 
     const parsedHours = parseDuration(duration);
     const rangeTotal = startTime && endTime ? rangeHours(startTime, endTime) : null;
@@ -83,19 +86,17 @@ export default function TimeLog({ task, currentUser, onAdd, onDelete }) {
             return;
         }
 
-        setSaving(true);
-
-        try {
-            await onAdd(entry);
-            setDuration('');
-            setStartTime('');
-            setEndTime('');
-            setNote('');
-        } catch (requestError) {
-            setError(requestError.message);
-        } finally {
-            setSaving(false);
-        }
+        run('add', async () => {
+            try {
+                await onAdd(entry);
+                setDuration('');
+                setStartTime('');
+                setEndTime('');
+                setNote('');
+            } catch (requestError) {
+                setError(requestError.message);
+            }
+        });
     }
 
     let rangeHint = 'Same day';
@@ -199,7 +200,7 @@ export default function TimeLog({ task, currentUser, onAdd, onDelete }) {
                     <Field label="Note" htmlFor="time-note" hint="Optional" className="col-span-2 sm:col-span-1">
                         <Input id="time-note" value={note} onChange={(event) => setNote(event.target.value)} maxLength={500} />
                     </Field>
-                    <Button type="submit" variant="primary" disabled={saving} className="col-span-2 sm:col-span-1 sm:mt-6">
+                    <Button type="submit" variant="primary" loading={saving} className="col-span-2 sm:col-span-1 sm:mt-6">
                         {saving ? 'Logging…' : 'Log time'}
                     </Button>
                 </div>
@@ -237,10 +238,14 @@ export default function TimeLog({ task, currentUser, onAdd, onDelete }) {
                                     {(entry.userId === currentUser.id || currentUser.role === 'admin') && (
                                         <button
                                             type="button"
-                                            onClick={() => onDelete(entry.id)}
-                                            className="rounded px-1.5 text-xs text-zinc-500 hover:bg-red-50 hover:text-red-700 dark:hover:bg-red-950 dark:hover:text-red-300"
+                                            onClick={() => run(`remove-${entry.id}`, () => onDelete(entry.id))}
+                                            disabled={isBusy(`remove-${entry.id}`)}
+                                            aria-busy={isBusy(`remove-${entry.id}`) || undefined}
+                                            className="inline-flex items-center gap-1 rounded px-1.5 text-xs text-zinc-500 hover:bg-red-50 hover:text-red-700 disabled:cursor-not-allowed disabled:opacity-60 dark:hover:bg-red-950 dark:hover:text-red-300"
                                         >
-                                            Remove<span className="sr-only"> {formatHours(entry.hours)} on {formatDate(entry.date)}</span>
+                                            {isBusy(`remove-${entry.id}`) && <Spinner className="h-3 w-3" />}
+                                            {isBusy(`remove-${entry.id}`) ? 'Removing…' : 'Remove'}
+                                            <span className="sr-only"> {formatHours(entry.hours)} on {formatDate(entry.date)}</span>
                                         </button>
                                     )}
                                 </td>

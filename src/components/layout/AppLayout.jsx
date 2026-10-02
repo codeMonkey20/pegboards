@@ -1,6 +1,11 @@
 import { useState } from 'react';
 import Head from 'next/head';
+import { useRouter } from 'next/router';
 
+import Skeleton from '@/components/ui/Skeleton';
+import { pathOf, useRouteLoading } from '@/lib/useRouteLoading';
+
+import PageSkeleton from './PageSkeleton';
 import Sidebar from './Sidebar';
 
 /**
@@ -18,7 +23,12 @@ import Sidebar from './Sidebar';
  * @returns {JSX.Element}
  */
 export default function AppLayout({ title, currentUser, nav, actions, subtitle, fullWidth = false, children }) {
+    const router = useRouter();
     const [menuOpen, setMenuOpen] = useState(false);
+    const loadingUrl = useRouteLoading();
+    // Refreshing the current page (same path) keeps its content on screen;
+    // only moving to another page swaps in a skeleton.
+    const leavingTo = loadingUrl && pathOf(loadingUrl) !== pathOf(router.asPath) ? pathOf(loadingUrl) : null;
 
     return (
         <>
@@ -46,15 +56,24 @@ export default function AppLayout({ title, currentUser, nav, actions, subtitle, 
                                 <path d="M3 5h14a1 1 0 1 0 0-2H3a1 1 0 0 0 0 2Zm14 4H3a1 1 0 0 0 0 2h14a1 1 0 1 0 0-2Zm0 6H3a1 1 0 0 0 0 2h14a1 1 0 1 0 0-2Z" />
                             </svg>
                         </button>
-                        <div className="min-w-0 flex-1">
-                            <h1 className="truncate text-lg font-semibold">{title}</h1>
-                            {subtitle && <p className="truncate text-sm text-zinc-500 dark:text-zinc-400">{subtitle}</p>}
-                        </div>
-                        {actions && <div className="flex flex-wrap items-center gap-2">{actions}</div>}
+                        {leavingTo ? (
+                            <div className="min-w-0 flex-1 space-y-1.5 py-1">
+                                <Skeleton className="h-5 w-48" />
+                                <Skeleton className="h-3 w-32" />
+                            </div>
+                        ) : (
+                            <>
+                                <div className="min-w-0 flex-1">
+                                    <h1 className="truncate text-lg font-semibold">{title}</h1>
+                                    {subtitle && <p className="truncate text-sm text-zinc-500 dark:text-zinc-400">{subtitle}</p>}
+                                </div>
+                                {actions && <div className="flex flex-wrap items-center gap-2">{actions}</div>}
+                            </>
+                        )}
                     </header>
 
                     <main className={`flex-1 p-4 sm:p-6 ${fullWidth ? 'flex min-h-0 min-w-0 flex-col' : 'mx-auto w-full max-w-6xl'}`}>
-                        {children}
+                        {leavingTo ? <PageSkeleton path={leavingTo} /> : children}
                     </main>
                 </div>
             </div>

@@ -1,9 +1,10 @@
-import { useState } from 'react';
 import Link from 'next/link';
 import { useRouter } from 'next/router';
 
 import Avatar from '@/components/ui/Avatar';
+import Spinner from '@/components/ui/Spinner';
 import { api } from '@/lib/api';
+import { useBusy } from '@/lib/useBusy';
 
 /**
  * @param {Object} props
@@ -63,19 +64,21 @@ function NavSection({ title, href, children }) {
  */
 export default function Sidebar({ currentUser, nav, open, onClose }) {
     const router = useRouter();
-    const [signingOut, setSigningOut] = useState(false);
+    const { run, isBusy } = useBusy();
+    const signingOut = isBusy('sign-out');
     const path = router.asPath.split('?')[0];
 
-    async function signOut() {
-        setSigningOut(true);
+    function signOut() {
+        // Stays busy until the login page has loaded, so it can't be clicked twice.
+        run('sign-out', async () => {
+            try {
+                await api('/api/auth/logout', { method: 'POST' });
+            } catch (error) {
+                console.error('Sign-out request failed:', error);
+            }
 
-        try {
-            await api('/api/auth/logout', { method: 'POST' });
-        } catch (error) {
-            console.error('Sign-out request failed:', error);
-        }
-
-        router.push('/login');
+            await router.push('/login');
+        });
     }
 
     return (
@@ -155,9 +158,11 @@ export default function Sidebar({ currentUser, nav, open, onClose }) {
                         type="button"
                         onClick={signOut}
                         disabled={signingOut}
-                        className="rounded-md px-2 py-1 text-xs text-zinc-600 hover:bg-zinc-100 dark:text-zinc-300 dark:hover:bg-zinc-800"
+                        aria-busy={signingOut || undefined}
+                        className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs text-zinc-600 hover:bg-zinc-100 disabled:cursor-not-allowed disabled:opacity-70 dark:text-zinc-300 dark:hover:bg-zinc-800"
                     >
-                        Sign out
+                        {signingOut && <Spinner className="h-3 w-3" />}
+                        {signingOut ? 'Signing out…' : 'Sign out'}
                     </button>
                 </div>
             </nav>

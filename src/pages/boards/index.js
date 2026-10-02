@@ -9,6 +9,7 @@ import { ErrorMessage, Field, Input, Textarea } from '@/components/ui/Field';
 import Modal from '@/components/ui/Modal';
 import { api } from '@/lib/api';
 import { COLORS } from '@/lib/constants';
+import { useBusy } from '@/lib/useBusy';
 import { withPageAuth } from '@/server/page';
 import { listProjects } from '@/server/projects';
 
@@ -22,25 +23,28 @@ function NewBoardModal({ open, onClose }) {
     const router = useRouter();
     const [color, setColor] = useState(COLORS[0]);
     const [error, setError] = useState(null);
-    const [saving, setSaving] = useState(false);
+    const { run, isBusy } = useBusy();
+    const saving = isBusy('create');
 
-    async function handleSubmit(event) {
+    function handleSubmit(event) {
         event.preventDefault();
-        setError(null);
-        setSaving(true);
 
         const form = new FormData(event.currentTarget);
 
-        try {
-            const { id } = await api('/api/projects', {
-                method: 'POST',
-                body: { name: form.get('name'), description: form.get('description'), color },
-            });
-            router.push(`/boards/${id}`);
-        } catch (requestError) {
-            setError(requestError.message);
-            setSaving(false);
-        }
+        // Stays busy until the new board has loaded, so it can't be created twice.
+        run('create', async () => {
+            setError(null);
+
+            try {
+                const { id } = await api('/api/projects', {
+                    method: 'POST',
+                    body: { name: form.get('name'), description: form.get('description'), color },
+                });
+                await router.push(`/boards/${id}`);
+            } catch (requestError) {
+                setError(requestError.message);
+            }
+        });
     }
 
     return (
@@ -58,8 +62,8 @@ function NewBoardModal({ open, onClose }) {
                 </p>
                 <ErrorMessage message={error} />
                 <div className="flex justify-end gap-2">
-                    <Button onClick={onClose}>Cancel</Button>
-                    <Button type="submit" variant="primary" disabled={saving}>
+                    <Button onClick={onClose} disabled={saving}>Cancel</Button>
+                    <Button type="submit" variant="primary" loading={saving}>
                         {saving ? 'Creating…' : 'Create board'}
                     </Button>
                 </div>

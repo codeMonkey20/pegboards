@@ -3,6 +3,8 @@ import { useEffect, useState } from 'react';
 import Button from '@/components/ui/Button';
 import { ErrorMessage, Field, Input, Select } from '@/components/ui/Field';
 import Modal from '@/components/ui/Modal';
+import Skeleton from '@/components/ui/Skeleton';
+import Spinner from '@/components/ui/Spinner';
 import { api } from '@/lib/api';
 import {
     CHART_TYPES,
@@ -16,6 +18,7 @@ import {
     TIME_GROUP_BYS,
     WIDGET_WIDTHS,
 } from '@/lib/constants';
+import { useBusy } from '@/lib/useBusy';
 
 import WidgetChart from './WidgetChart';
 
@@ -96,13 +99,17 @@ export default function WidgetEditor({ widget, projects, users, onClose, onSave 
     const [title, setTitle] = useState(widget?.title ?? '');
     const [width, setWidth] = useState(widget?.width ?? 'third');
     const [config, setConfig] = useState(widget?.config ?? DEFAULT_WIDGET_CONFIG);
+    // Both remember which config they belong to, so the preview can tell
+    // when it is out of date without extra loading state.
     const [preview, setPreview] = useState(widget ? { config: widget.config, data: widget.data } : null);
     const [previewError, setPreviewError] = useState(null);
     const [error, setError] = useState(null);
-    const [saving, setSaving] = useState(false);
+    const { run, isBusy } = useBusy();
+    const saving = isBusy('save');
 
     const metric = METRICS.find((option) => option.value === config.metric);
     const isCustomRange = config.filters.dateRange === 'custom';
+    const isPreviewLoading = preview?.config !== config && previewError?.config !== config;
 
     // Debounced so typing custom dates doesn't send a request per keystroke.
     useEffect(() => {
@@ -117,7 +124,7 @@ export default function WidgetEditor({ widget, projects, users, onClose, onSave 
                 })
                 .catch((requestError) => {
                     if (!ignore) {
-                        setPreviewError(requestError.message);
+                        setPreviewError({ config, message: requestError.message });
                     }
                 });
         }, 250);
@@ -138,17 +145,18 @@ export default function WidgetEditor({ widget, projects, users, onClose, onSave 
         setConfig((current) => ({ ...current, filters: { ...current.filters, ...changes } }));
     }
 
-    async function handleSubmit(event) {
+    function handleSubmit(event) {
         event.preventDefault();
-        setError(null);
-        setSaving(true);
 
-        try {
-            await onSave({ title: title.trim() || metric.label, width, config });
-        } catch (requestError) {
-            setError(requestError.message);
-            setSaving(false);
-        }
+        run('save', async () => {
+            setError(null);
+
+            try {
+                await onSave({ title: title.trim() || metric.label, width, config });
+            } catch (requestError) {
+                setError(requestError.message);
+            }
+        });
     }
 
     const groupOptions = GROUP_BYS.filter((group) => {
@@ -259,22 +267,42 @@ export default function WidgetEditor({ widget, projects, users, onClose, onSave 
                 </div>
 
                 <div className="flex flex-col gap-4">
-                    <section aria-labelledby="preview-heading" className="rounded-xl border border-zinc-200 p-4 dark:border-zinc-800">
-                        <h3 id="preview-heading" className="text-sm font-semibold">{title.trim() || metric.label}</h3>
+                    <section
+                        aria-labelledby="preview-heading"
+                        aria-busy={isPreviewLoading || undefined}
+                        className="rounded-xl border border-zinc-200 p-4 dark:border-zinc-800"
+                    >
+                        <div className="flex items-start justify-between gap-2">
+                            <h3 id="preview-heading" className="text-sm font-semibold">{title.trim() || metric.label}</h3>
+                            {isPreviewLoading && preview && (
+                                <span role="status" className="flex shrink-0 items-center gap-1 text-xs text-zinc-500 dark:text-zinc-400">
+                                    <Spinner className="h-3.5 w-3.5" />
+                                    Updating…
+                                </span>
+                            )}
+                        </div>
                         <p className="mb-3 text-xs text-zinc-500 dark:text-zinc-400">Preview</p>
-                        <ErrorMessage message={previewError} />
+                        <ErrorMessage message={previewError?.message ?? null} />
                         {preview ? (
-                            <WidgetChart config={preview.config} data={preview.data} />
+                            <div className={`transition-opacity ${isPreviewLoading ? 'opacity-50' : ''}`}>
+                                <WidgetChart config={preview.config} data={preview.data} />
+                            </div>
                         ) : (
-                            <p className="py-8 text-center text-sm text-zinc-500" role="status">Loading preview…</p>
+                            !previewError && (
+                                <div role="status" aria-label="Loading preview" className="space-y-3 py-2">
+                                    <Skeleton className="h-10 w-28" />
+                                    <Skeleton className="h-3 w-3/4" />
+                                    <Skeleton className="h-24 w-full" />
+                                </div>
+                            )
                         )}
                     </section>
 
                     <ErrorMessage message={error} />
 
                     <div className="mt-auto flex justify-end gap-2">
-                        <Button onClick={onClose}>Cancel</Button>
-                        <Button type="submit" variant="primary" disabled={saving}>
+                        <Button onClick={onClose} disabled={saving}>Cancel</Button>
+                        <Button type="submit" variant="primary" loading={saving}>
                             {saving ? 'Saving…' : widget ? 'Save widget' : 'Add widget'}
                         </Button>
                     </div>

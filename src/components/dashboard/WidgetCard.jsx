@@ -1,4 +1,5 @@
 import { DATE_RANGES, ME, METRICS } from '@/lib/constants';
+import Spinner from '@/components/ui/Spinner';
 import { formatDate } from '@/lib/format';
 
 import WidgetChart from './WidgetChart';
@@ -62,19 +63,23 @@ function describeFilters(config, projectNames, userNames) {
  * @param {boolean} props.isLast
  * @param {Map<number, string>} props.projectNames
  * @param {Map<number, string>} props.userNames
+ * @param {'moving'|'removing'|null} [props.busy] - A request for this widget is running.
+ * @param {boolean} [props.moveDisabled] - Another reorder is still saving.
  * @param {() => void} props.onEdit
  * @param {(direction: -1|1) => void} props.onMove
  * @param {() => void} props.onDelete
  * @returns {JSX.Element}
  */
-export default function WidgetCard({ widget, canEdit, isFirst, isLast, projectNames, userNames, onEdit, onMove, onDelete }) {
+export default function WidgetCard({ widget, canEdit, isFirst, isLast, projectNames, userNames, busy = null, moveDisabled = false, onEdit, onMove, onDelete }) {
     const metricLabel = METRICS.find((metric) => metric.value === widget.config.metric)?.label;
-    const controlClass = 'rounded px-1.5 py-0.5 text-xs text-zinc-500 hover:bg-zinc-100 hover:text-zinc-900 disabled:opacity-30 dark:hover:bg-zinc-800 dark:hover:text-zinc-100';
+    const controlClass = 'rounded px-1.5 py-0.5 text-xs text-zinc-500 hover:bg-zinc-100 hover:text-zinc-900 disabled:cursor-not-allowed disabled:opacity-30 dark:hover:bg-zinc-800 dark:hover:text-zinc-100';
+    const isBusy = busy !== null;
 
     return (
         <article
             aria-labelledby={`widget-${widget.id}`}
-            className={`col-span-1 flex flex-col rounded-xl border border-zinc-200 bg-white p-4 shadow-sm dark:border-zinc-800 dark:bg-zinc-900 ${WIDTH_CLASSES[widget.width] ?? WIDTH_CLASSES.third}`}
+            aria-busy={isBusy || undefined}
+            className={`col-span-1 flex flex-col rounded-xl border border-zinc-200 bg-white p-4 shadow-sm transition-opacity dark:border-zinc-800 dark:bg-zinc-900 ${WIDTH_CLASSES[widget.width] ?? WIDTH_CLASSES.third} ${busy === 'removing' ? 'opacity-50' : ''}`}
         >
             <header className="mb-3 flex items-start gap-2">
                 <div className="min-w-0 flex-1">
@@ -83,20 +88,26 @@ export default function WidgetCard({ widget, canEdit, isFirst, isLast, projectNa
                         {metricLabel} · {describeFilters(widget.config, projectNames, userNames)}
                     </p>
                 </div>
+                {isBusy && (
+                    <span role="status" className="flex shrink-0 items-center gap-1 text-xs text-zinc-500 dark:text-zinc-400">
+                        <Spinner className="h-3.5 w-3.5" />
+                        {busy === 'removing' ? 'Removing…' : 'Saving…'}
+                    </span>
+                )}
                 {canEdit && (
                     <div className="flex shrink-0 gap-0.5">
-                        <button type="button" onClick={() => onMove(-1)} disabled={isFirst} className={controlClass}>
+                        <button type="button" onClick={() => onMove(-1)} disabled={isFirst || isBusy || moveDisabled} className={controlClass}>
                             <span aria-hidden="true">←</span>
                             <span className="sr-only">Move {widget.title} earlier</span>
                         </button>
-                        <button type="button" onClick={() => onMove(1)} disabled={isLast} className={controlClass}>
+                        <button type="button" onClick={() => onMove(1)} disabled={isLast || isBusy || moveDisabled} className={controlClass}>
                             <span aria-hidden="true">→</span>
                             <span className="sr-only">Move {widget.title} later</span>
                         </button>
-                        <button type="button" onClick={onEdit} className={controlClass}>
+                        <button type="button" onClick={onEdit} disabled={isBusy} className={controlClass}>
                             Edit<span className="sr-only"> {widget.title}</span>
                         </button>
-                        <button type="button" onClick={onDelete} className={`${controlClass} hover:text-red-700 dark:hover:text-red-300`}>
+                        <button type="button" onClick={onDelete} disabled={isBusy} className={`${controlClass} hover:text-red-700 dark:hover:text-red-300`}>
                             Remove<span className="sr-only"> {widget.title}</span>
                         </button>
                     </div>

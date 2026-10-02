@@ -3,6 +3,7 @@ import { useState } from 'react';
 import Button from '@/components/ui/Button';
 import { ErrorMessage, Textarea } from '@/components/ui/Field';
 import { formatTimestamp } from '@/lib/format';
+import { useBusy } from '@/lib/useBusy';
 
 /**
  * A task's comment thread.
@@ -15,26 +16,26 @@ import { formatTimestamp } from '@/lib/format';
 export default function Comments({ comments, onAdd }) {
     const [body, setBody] = useState('');
     const [error, setError] = useState(null);
-    const [saving, setSaving] = useState(false);
+    const { run, isBusy } = useBusy();
+    const saving = isBusy('post');
 
-    async function handleSubmit(event) {
+    function handleSubmit(event) {
         event.preventDefault();
 
         if (!body.trim()) {
             return;
         }
 
-        setError(null);
-        setSaving(true);
+        run('post', async () => {
+            setError(null);
 
-        try {
-            await onAdd(body.trim());
-            setBody('');
-        } catch (requestError) {
-            setError(requestError.message);
-        } finally {
-            setSaving(false);
-        }
+            try {
+                await onAdd(body.trim());
+                setBody('');
+            } catch (requestError) {
+                setError(requestError.message);
+            }
+        });
     }
 
     return (
@@ -70,7 +71,7 @@ export default function Comments({ comments, onAdd }) {
                 />
                 <ErrorMessage message={error} />
                 <div className="flex justify-end">
-                    <Button type="submit" size="sm" variant="primary" disabled={saving || !body.trim()}>
+                    <Button type="submit" size="sm" variant="primary" loading={saving} disabled={!body.trim()}>
                         {saving ? 'Posting…' : 'Comment'}
                     </Button>
                 </div>

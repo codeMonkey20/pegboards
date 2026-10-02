@@ -5,6 +5,7 @@ import AuthLayout from '@/components/layout/AuthLayout';
 import Button from '@/components/ui/Button';
 import { ErrorMessage, Field, Input } from '@/components/ui/Field';
 import { api } from '@/lib/api';
+import { useBusy } from '@/lib/useBusy';
 import { getSessionUser, needsSetup } from '@/server/auth';
 
 /**
@@ -25,25 +26,28 @@ function safeRedirect(next) {
 export default function LoginPage() {
     const router = useRouter();
     const [error, setError] = useState(null);
-    const [submitting, setSubmitting] = useState(false);
+    const { run, isBusy } = useBusy();
+    const submitting = isBusy('submit');
 
-    async function handleSubmit(event) {
+    function handleSubmit(event) {
         event.preventDefault();
-        setError(null);
-        setSubmitting(true);
 
         const form = new FormData(event.currentTarget);
 
-        try {
-            await api('/api/auth/login', {
-                method: 'POST',
-                body: { email: form.get('email'), password: form.get('password') },
-            });
-            router.push(safeRedirect(router.query.next));
-        } catch (requestError) {
-            setError(requestError.message);
-            setSubmitting(false);
-        }
+        // Stays busy until the next page has loaded, so it can't be submitted twice.
+        run('submit', async () => {
+            setError(null);
+
+            try {
+                await api('/api/auth/login', {
+                    method: 'POST',
+                    body: { email: form.get('email'), password: form.get('password') },
+                });
+                await router.push(safeRedirect(router.query.next));
+            } catch (requestError) {
+                setError(requestError.message);
+            }
+        });
     }
 
     return (
@@ -56,7 +60,7 @@ export default function LoginPage() {
                     <Input id="password" name="password" type="password" autoComplete="current-password" required />
                 </Field>
                 <ErrorMessage message={error} />
-                <Button type="submit" variant="primary" className="w-full" disabled={submitting}>
+                <Button type="submit" variant="primary" className="w-full" loading={submitting}>
                     {submitting ? 'Signing in…' : 'Sign in'}
                 </Button>
                 <p className="text-center text-xs text-zinc-500 dark:text-zinc-400">

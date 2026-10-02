@@ -8,6 +8,7 @@ import Button from '@/components/ui/Button';
 import { ErrorMessage, Field, Input } from '@/components/ui/Field';
 import Modal from '@/components/ui/Modal';
 import { api } from '@/lib/api';
+import { useBusy } from '@/lib/useBusy';
 import { listWidgets, requireDashboard } from '@/server/dashboards';
 import { HttpError } from '@/server/http';
 import { withPageAuth } from '@/server/page';
@@ -35,39 +36,45 @@ import { listUsers } from '@/server/users';
 function DashboardSettingsModal({ dashboard, onClose }) {
     const router = useRouter();
     const [error, setError] = useState(null);
-    const [saving, setSaving] = useState(false);
+    const { run, isBusy, anyBusy } = useBusy();
 
-    async function handleSubmit(event) {
+    function handleSubmit(event) {
         event.preventDefault();
-        setError(null);
-        setSaving(true);
 
         const form = new FormData(event.currentTarget);
 
-        try {
-            await api(`/api/dashboards/${dashboard.id}`, {
-                method: 'PATCH',
-                body: { name: form.get('name'), isShared: form.get('shared') === 'on' },
-            });
-            await router.replace(router.asPath, undefined, { scroll: false });
-            onClose();
-        } catch (requestError) {
-            setError(requestError.message);
-            setSaving(false);
-        }
+        run('save', async () => {
+            setError(null);
+
+            try {
+                await api(`/api/dashboards/${dashboard.id}`, {
+                    method: 'PATCH',
+                    body: { name: form.get('name'), isShared: form.get('shared') === 'on' },
+                });
+                // Reload the page data so the header and sidebar show the new name.
+                await router.replace(router.asPath, undefined, { scroll: false });
+                onClose();
+            } catch (requestError) {
+                setError(requestError.message);
+            }
+        });
     }
 
-    async function handleDelete() {
+    function handleDelete() {
         if (!window.confirm(`Delete the dashboard “${dashboard.name}”?`)) {
             return;
         }
 
-        try {
-            await api(`/api/dashboards/${dashboard.id}`, { method: 'DELETE' });
-            router.push('/dashboards');
-        } catch (requestError) {
-            setError(requestError.message);
-        }
+        run('delete', async () => {
+            setError(null);
+
+            try {
+                await api(`/api/dashboards/${dashboard.id}`, { method: 'DELETE' });
+                await router.push('/dashboards');
+            } catch (requestError) {
+                setError(requestError.message);
+            }
+        });
     }
 
     return (
@@ -87,13 +94,19 @@ function DashboardSettingsModal({ dashboard, onClose }) {
                 </label>
                 <ErrorMessage message={error} />
                 <div className="flex flex-wrap justify-between gap-2">
-                    <Button variant="ghost" onClick={handleDelete} className="text-red-700 dark:text-red-400">
-                        Delete dashboard
+                    <Button
+                        variant="ghost"
+                        onClick={handleDelete}
+                        loading={isBusy('delete')}
+                        disabled={anyBusy}
+                        className="text-red-700 dark:text-red-400"
+                    >
+                        {isBusy('delete') ? 'Deleting…' : 'Delete dashboard'}
                     </Button>
                     <div className="flex gap-2">
-                        <Button onClick={onClose}>Cancel</Button>
-                        <Button type="submit" variant="primary" disabled={saving}>
-                            {saving ? 'Saving…' : 'Save'}
+                        <Button onClick={onClose} disabled={anyBusy}>Cancel</Button>
+                        <Button type="submit" variant="primary" loading={isBusy('save')} disabled={anyBusy}>
+                            {isBusy('save') ? 'Saving…' : 'Save'}
                         </Button>
                     </div>
                 </div>
@@ -112,8 +125,11 @@ function DashboardView({ dashboard, widgets: initialWidgets, projects, users, cu
     const [editing, setEditing] = useState(null);
     const [settingsOpen, setSettingsOpen] = useState(false);
     const [error, setError] = useState(null);
+    const { run, isBusy } = useBusy();
 
     const projectNames = new Map(projects.map((project) => [project.id, project.name]));
+    // One reorder at a time keeps the optimistic order and the saved order in step.
+    const isReordering = widgets.some((widget) => isBusy(`move-${widget.id}`));
     const userNames = new Map(users.map((user) => [user.id, user.name]));
 
     async function saveWidget(values) {
@@ -129,6 +145,7 @@ function DashboardView({ dashboard, widgets: initialWidgets, projects, users, cu
     }
 
     function moveWidget(index, direction) {
+        const widget = widgets[index];
         const target = index + direction;
         const previous = widgets;
         const reordered = [...widgets];
@@ -137,24 +154,43 @@ function DashboardView({ dashboard, widgets: initialWidgets, projects, users, cu
         setWidgets(reordered);
         setError(null);
 
-        api(`/api/widgets/${widgets[index].id}`, { method: 'PATCH', body: { move: direction } }).catch((requestError) => {
-            setWidgets(previous);
-            setError(requestError.message);
+        run(`move-${widget.id}`, async () => {
+            try {
+                await api(`/api/widgets/${widget.id}`, { method: 'PATCH', body: { move: direction } });
+            } catch (requestError) {
+                setWidgets(previous);
+                setError(requestError.message);
+            }
         });
     }
 
-    async function deleteWidget(widget) {
+    function deleteWidget(widget) {
         if (!window.confirm(`Remove “${widget.title}” from this dashboard?`)) {
             return;
         }
 
-        try {
+        run(`delete-${widget.id}`, async () => {
             setError(null);
-            await api(`/api/widgets/${widget.id}`, { method: 'DELETE' });
-            setWidgets((current) => current.filter((item) => item.id !== widget.id));
-        } catch (requestError) {
-            setError(requestError.message);
+
+            try {
+                await api(`/api/widgets/${widget.id}`, { method: 'DELETE' });
+                setWidgets((current) => current.filter((item) => item.id !== widget.id));
+            } catch (requestError) {
+                setError(requestError.message);
+            }
+        });
+    }
+
+    /**
+     * @param {number} widgetId
+     * @returns {'moving'|'removing'|null}
+     */
+    function busyStateOf(widgetId) {
+        if (isBusy(`delete-${widgetId}`)) {
+            return 'removing';
         }
+
+        return isBusy(`move-${widgetId}`) ? 'moving' : null;
     }
 
     const ownership = dashboard.ownerId === currentUser.id ? 'Your dashboard' : `Shared by ${dashboard.ownerName}`;
@@ -200,6 +236,8 @@ function DashboardView({ dashboard, widgets: initialWidgets, projects, users, cu
                                 isLast={index === widgets.length - 1}
                                 projectNames={projectNames}
                                 userNames={userNames}
+                                busy={busyStateOf(widget.id)}
+                                moveDisabled={isReordering}
                                 onEdit={() => setEditing(widget)}
                                 onMove={(direction) => moveWidget(index, direction)}
                                 onDelete={() => deleteWidget(widget)}

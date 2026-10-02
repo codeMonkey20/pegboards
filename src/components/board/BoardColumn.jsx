@@ -1,5 +1,7 @@
 import { useState } from 'react';
 
+import Spinner from '@/components/ui/Spinner';
+
 import TaskCard from './TaskCard';
 
 /**
@@ -65,10 +67,21 @@ function QuickAdd({ statusName, onCreate }) {
                 className="w-full rounded-md border border-violet-400 bg-white px-2.5 py-2 text-sm focus:outline-2 focus:outline-violet-500/40 dark:bg-zinc-900"
             />
             <div className="mt-1.5 flex gap-2">
-                <button type="submit" disabled={saving} className="rounded-md bg-violet-600 px-2.5 py-1 text-xs font-medium text-white hover:bg-violet-700">
-                    Add
+                <button
+                    type="submit"
+                    disabled={saving}
+                    aria-busy={saving || undefined}
+                    className="inline-flex items-center gap-1 rounded-md bg-violet-600 px-2.5 py-1 text-xs font-medium text-white hover:bg-violet-700 disabled:cursor-not-allowed disabled:bg-violet-400"
+                >
+                    {saving && <Spinner className="h-3 w-3" />}
+                    {saving ? 'Adding…' : 'Add'}
                 </button>
-                <button type="button" onClick={() => setOpen(false)} className="rounded-md px-2.5 py-1 text-xs text-zinc-600 hover:bg-zinc-200 dark:text-zinc-400 dark:hover:bg-zinc-800">
+                <button
+                    type="button"
+                    onClick={() => setOpen(false)}
+                    disabled={saving}
+                    className="rounded-md px-2.5 py-1 text-xs text-zinc-600 hover:bg-zinc-200 disabled:cursor-not-allowed disabled:opacity-50 dark:text-zinc-400 dark:hover:bg-zinc-800"
+                >
                     Cancel
                 </button>
             </div>
@@ -85,6 +98,7 @@ function QuickAdd({ statusName, onCreate }) {
  * @param {number} props.totalCount - Tasks in the column before filtering.
  * @param {Map<number, import('@/server/users').User>} props.usersById
  * @param {number|null} props.draggingTaskId
+ * @param {(taskId: number) => boolean} props.isTaskBusy - True while a task's move is saving.
  * @param {number|null} props.dropIndex - Where the drop marker shows, if this column is the target.
  * @param {(taskId: number) => void} props.onOpenTask
  * @param {(event: React.DragEvent, taskId: number) => void} props.onDragStart
@@ -100,6 +114,7 @@ export default function BoardColumn({
     totalCount,
     usersById,
     draggingTaskId,
+    isTaskBusy,
     dropIndex,
     onOpenTask,
     onDragStart,
@@ -153,6 +168,7 @@ export default function BoardColumn({
                             assignee={usersById.get(task.assigneeId)}
                             isDone={status.isDone}
                             isDragging={draggingTaskId === task.id}
+                            isSaving={isTaskBusy(task.id)}
                             onOpen={onOpenTask}
                             onDragStart={onDragStart}
                             onDragEnd={onDragEnd}

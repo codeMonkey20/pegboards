@@ -1,11 +1,14 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 
 import Button from '@/components/ui/Button';
 import { ErrorMessage, Field, Input, Select, Textarea } from '@/components/ui/Field';
 import Modal from '@/components/ui/Modal';
+import Skeleton from '@/components/ui/Skeleton';
+import Spinner from '@/components/ui/Spinner';
 import { api } from '@/lib/api';
 import { PRIORITIES } from '@/lib/constants';
 import { formatTimestamp } from '@/lib/format';
+import { useBusy } from '@/lib/useBusy';
 
 import Comments from './Comments';
 import TimeLog from './TimeLog';
@@ -110,6 +113,66 @@ function TaskFields({ task, statuses, users, onSave }) {
 }
 
 /**
+ * Placeholder in the shape of the task panel while it loads.
+ *
+ * @returns {JSX.Element}
+ */
+function TaskSkeleton() {
+    return (
+        <div role="status" aria-label="Loading task" className="space-y-6">
+            <div className="space-y-2">
+                <Skeleton className="h-3 w-12" />
+                <Skeleton className="h-10 w-full" />
+            </div>
+            <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
+                {Array.from({ length: 5 }, (_, index) => (
+                    <div key={index} className="space-y-2">
+                        <Skeleton className="h-3 w-16" />
+                        <Skeleton className="h-10 w-full" />
+                    </div>
+                ))}
+            </div>
+            <div className="space-y-2">
+                <Skeleton className="h-3 w-20" />
+                <Skeleton className="h-24 w-full" />
+            </div>
+            <div className="space-y-2">
+                <Skeleton className="h-4 w-28" />
+                <Skeleton className="h-2 w-full" />
+                <Skeleton className="h-20 w-full" />
+            </div>
+        </div>
+    );
+}
+
+/**
+ * "Saving…" / "All changes saved" for fields that save automatically.
+ *
+ * @param {Object} props
+ * @param {boolean} props.saving
+ * @param {boolean} props.hasSaved
+ * @returns {JSX.Element}
+ */
+function SaveStatus({ saving, hasSaved }) {
+    return (
+        <p role="status" className="flex h-5 items-center justify-end gap-1.5 text-xs text-zinc-500 dark:text-zinc-400">
+            {saving && (
+                <>
+                    <Spinner className="h-3.5 w-3.5" />
+                    Saving…
+                </>
+            )}
+            {!saving && hasSaved && (
+                <>
+                    <span aria-hidden="true">✓</span>
+                    All changes saved
+                </>
+            )}
+        </p>
+    );
+}
+
+/**
  * Task detail dialog: fields, time tracking and comments. Mount it only
  * while a task is open, keyed by task id, so each task starts fresh.
  *
@@ -126,6 +189,12 @@ function TaskFields({ task, statuses, users, onSave }) {
 export default function TaskModal({ taskId, statuses, users, currentUser, onClose, onChange, onDelete }) {
     const [task, setTask] = useState(null);
     const [error, setError] = useState(null);
+    const [pendingSaves, setPendingSaves] = useState(0);
+    const [hasSaved, setHasSaved] = useState(false);
+    // Field saves run one after another so a slow request can't overwrite a newer edit.
+    const saveQueue = useRef(Promise.resolve());
+    const queuedSaves = useRef(0);
+    const { run, isBusy } = useBusy();
 
     useEffect(() => {
         let ignore = false;
@@ -161,14 +230,40 @@ export default function TaskModal({ taskId, statuses, users, currentUser, onClos
         onChange(updated);
     }
 
-    async function save(changes) {
+    function save(changes) {
         setError(null);
+        setPendingSaves((count) => count + 1);
+        // Show the edit straight away; the server's response replaces it when it arrives.
+        setTask((current) => ({ ...current, ...changes }));
+        queuedSaves.current += 1;
 
-        try {
-            await mutate(`/api/tasks/${taskId}`, 'PATCH', changes);
-        } catch (requestError) {
-            setError(requestError.message);
-        }
+        saveQueue.current = saveQueue.current.then(async () => {
+            try {
+                const updated = await api(`/api/tasks/${taskId}`, { method: 'PATCH', body: changes });
+
+                onChange(updated);
+                setHasSaved(true);
+
+                // An older response would briefly undo edits that are still queued.
+                if (queuedSaves.current === 1) {
+                    setTask(updated);
+                }
+            } catch (requestError) {
+                setError(requestError.message);
+
+                // Put the fields back to what is actually stored.
+                try {
+                    setTask(await api(`/api/tasks/${taskId}`));
+                } catch (reloadError) {
+                    console.error('Reloading the task after a failed save failed:', reloadError);
+                }
+            } finally {
+                queuedSaves.current -= 1;
+                setPendingSaves((count) => count - 1);
+            }
+        });
+
+        return saveQueue.current;
     }
 
     async function removeTimeEntry(entryId) {
@@ -181,27 +276,33 @@ export default function TaskModal({ taskId, statuses, users, currentUser, onClos
         }
     }
 
-    async function deleteTask() {
+    function deleteTask() {
         if (!window.confirm(`Delete “${task.title}”? This also removes its time entries and comments.`)) {
             return;
         }
 
-        try {
-            await api(`/api/tasks/${taskId}`, { method: 'DELETE' });
-            onDelete(taskId);
-        } catch (requestError) {
-            setError(requestError.message);
-        }
+        run('delete', async () => {
+            setError(null);
+
+            try {
+                await api(`/api/tasks/${taskId}`, { method: 'DELETE' });
+                onDelete(taskId);
+            } catch (requestError) {
+                setError(requestError.message);
+            }
+        });
     }
 
     return (
         <Modal open onClose={onClose} title={task?.title ?? 'Task'} size="lg">
-            {!task && !error && <p className="py-8 text-center text-sm text-zinc-500" role="status">Loading task…</p>}
+            {!task && !error && <TaskSkeleton />}
 
             <ErrorMessage message={error} />
 
             {task && (
                 <div className="space-y-6">
+                    <SaveStatus saving={pendingSaves > 0} hasSaved={hasSaved} />
+
                     <TaskFields key={task.id} task={task} statuses={statuses} users={users} onSave={save} />
 
                     <TimeLog
@@ -220,8 +321,8 @@ export default function TaskModal({ taskId, statuses, users, currentUser, onClos
                         <p>
                             Created {task.creatorName ? `by ${task.creatorName} ` : ''}on {formatTimestamp(task.createdAt)}
                         </p>
-                        <Button variant="ghost" size="sm" onClick={deleteTask} className="text-red-700 dark:text-red-400">
-                            Delete task
+                        <Button variant="ghost" size="sm" onClick={deleteTask} loading={isBusy('delete')} className="text-red-700 dark:text-red-400">
+                            {isBusy('delete') ? 'Deleting…' : 'Delete task'}
                         </Button>
                     </div>
                 </div>

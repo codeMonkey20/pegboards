@@ -1,5 +1,7 @@
 import { Geist, Geist_Mono } from 'next/font/google';
 
+import RouteProgress from '@/components/layout/RouteProgress';
+
 import '@/styles/globals.css';
 
 const geistSans = Geist({
@@ -23,6 +25,7 @@ const geistMono = Geist_Mono({
 export default function App({ Component, pageProps }) {
     return (
         <div className={`${geistSans.variable} ${geistMono.variable} font-sans`}>
+            <RouteProgress />
             <Component {...pageProps} />
         </div>
     );

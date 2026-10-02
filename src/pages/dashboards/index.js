@@ -7,6 +7,7 @@ import Button from '@/components/ui/Button';
 import { ErrorMessage, Field, Input } from '@/components/ui/Field';
 import Modal from '@/components/ui/Modal';
 import { api } from '@/lib/api';
+import { useBusy } from '@/lib/useBusy';
 import { listDashboards } from '@/server/dashboards';
 import { withPageAuth } from '@/server/page';
 
@@ -18,23 +19,25 @@ import { withPageAuth } from '@/server/page';
 function NewDashboardModal({ onClose }) {
     const router = useRouter();
     const [error, setError] = useState(null);
-    const [saving, setSaving] = useState(false);
+    const { run, isBusy } = useBusy();
+    const saving = isBusy('create');
 
-    async function handleSubmit(event) {
+    function handleSubmit(event) {
         event.preventDefault();
-        setError(null);
-        setSaving(true);
 
-        try {
-            const { id } = await api('/api/dashboards', {
-                method: 'POST',
-                body: { name: new FormData(event.currentTarget).get('name') },
-            });
-            router.push(`/dashboards/${id}`);
-        } catch (requestError) {
-            setError(requestError.message);
-            setSaving(false);
-        }
+        const name = new FormData(event.currentTarget).get('name');
+
+        // Stays busy until the new dashboard has loaded, so it can't be created twice.
+        run('create', async () => {
+            setError(null);
+
+            try {
+                const { id } = await api('/api/dashboards', { method: 'POST', body: { name } });
+                await router.push(`/dashboards/${id}`);
+            } catch (requestError) {
+                setError(requestError.message);
+            }
+        });
     }
 
     return (
@@ -45,8 +48,8 @@ function NewDashboardModal({ onClose }) {
                 </Field>
                 <ErrorMessage message={error} />
                 <div className="flex justify-end gap-2">
-                    <Button onClick={onClose}>Cancel</Button>
-                    <Button type="submit" variant="primary" disabled={saving}>
+                    <Button onClick={onClose} disabled={saving}>Cancel</Button>
+                    <Button type="submit" variant="primary" loading={saving}>
                         {saving ? 'Creating…' : 'Create dashboard'}
                     </Button>
                 </div>

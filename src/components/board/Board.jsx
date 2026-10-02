@@ -1,8 +1,10 @@
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 
 import { ErrorMessage, Input, Select } from '@/components/ui/Field';
+import Spinner from '@/components/ui/Spinner';
 import { api } from '@/lib/api';
 import { PRIORITIES } from '@/lib/constants';
+import { useBusy } from '@/lib/useBusy';
 
 import BoardColumn from './BoardColumn';
 import TaskModal from './TaskModal';
@@ -74,6 +76,11 @@ export default function Board({ statuses, initialTasks, users, currentUser, init
     const [dragging, setDragging] = useState(null);
     const [dropTarget, setDropTarget] = useState(null);
     const [error, setError] = useState(null);
+    const { run, isBusy, anyBusy } = useBusy();
+    // Moves are sent one at a time so the server applies them in the order
+    // they were made; only the last response replaces the board's tasks.
+    const moveQueue = useRef(Promise.resolve());
+    const pendingMoves = useRef(0);
 
     const usersById = new Map(users.map((user) => [user.id, user]));
     const isFiltered = filters.search !== '' || filters.assignee !== 'all' || filters.priority !== 'all';
@@ -181,13 +188,35 @@ export default function Board({ statuses, initialTasks, users, currentUser, init
             )
         );
 
-        try {
-            setError(null);
-            setTasks(await api(`/api/tasks/${taskId}/move`, { method: 'POST', body: { statusId, index } }));
-        } catch (requestError) {
-            setTasks(previous);
-            setError(`Couldn't move the task: ${requestError.message}`);
-        }
+        setError(null);
+
+        run(`move-${taskId}`, () => {
+            pendingMoves.current += 1;
+
+            const request = moveQueue.current.then(async () => {
+                const isLatest = () => pendingMoves.current === 1;
+
+                try {
+                    const saved = await api(`/api/tasks/${taskId}/move`, { method: 'POST', body: { statusId, index } });
+
+                    if (isLatest()) {
+                        setTasks(saved);
+                    }
+                } catch (requestError) {
+                    if (isLatest()) {
+                        setTasks(previous);
+                    }
+
+                    setError(`Couldn't move the task: ${requestError.message}`);
+                } finally {
+                    pendingMoves.current -= 1;
+                }
+            });
+
+            moveQueue.current = request;
+
+            return request;
+        });
     }
 
     function handleTaskChange(updated) {
@@ -241,6 +270,14 @@ export default function Board({ statuses, initialTasks, users, currentUser, init
                         Clear filters
                     </button>
                 )}
+                <p role="status" className="ml-auto flex h-10 items-center gap-1.5 text-sm text-zinc-500 dark:text-zinc-400">
+                    {anyBusy && (
+                        <>
+                            <Spinner />
+                            Saving…
+                        </>
+                    )}
+                </p>
             </div>
 
             <ErrorMessage message={error} />
@@ -258,6 +295,7 @@ export default function Board({ statuses, initialTasks, users, currentUser, init
                         totalCount={all.length}
                         usersById={usersById}
                         draggingTaskId={dragging}
+                        isTaskBusy={(taskId) => isBusy(`move-${taskId}`)}
                         dropIndex={dropTarget?.statusId === status.id ? dropTarget.index : null}
                         onOpenTask={setOpenTaskId}
                         onDragStart={handleDragStart}

@@ -5,6 +5,7 @@ import AuthLayout from '@/components/layout/AuthLayout';
 import Button from '@/components/ui/Button';
 import { ErrorMessage, Field, Input } from '@/components/ui/Field';
 import { api } from '@/lib/api';
+import { useBusy } from '@/lib/useBusy';
 import { needsSetup } from '@/server/auth';
 import { DEMO_PASSWORD } from '@/server/seed';
 
@@ -18,30 +19,33 @@ import { DEMO_PASSWORD } from '@/server/seed';
 export default function SetupPage({ demoPassword }) {
     const router = useRouter();
     const [error, setError] = useState(null);
-    const [submitting, setSubmitting] = useState(false);
+    const { run, isBusy } = useBusy();
+    const submitting = isBusy('submit');
 
-    async function handleSubmit(event) {
+    function handleSubmit(event) {
         event.preventDefault();
-        setError(null);
-        setSubmitting(true);
 
         const form = new FormData(event.currentTarget);
 
-        try {
-            await api('/api/auth/setup', {
-                method: 'POST',
-                body: {
-                    name: form.get('name'),
-                    email: form.get('email'),
-                    password: form.get('password'),
-                    includeDemoData: form.get('demo') === 'on',
-                },
-            });
-            router.push('/');
-        } catch (requestError) {
-            setError(requestError.message);
-            setSubmitting(false);
-        }
+        // Stays busy until the home page has loaded, so it can't be submitted twice.
+        run('submit', async () => {
+            setError(null);
+
+            try {
+                await api('/api/auth/setup', {
+                    method: 'POST',
+                    body: {
+                        name: form.get('name'),
+                        email: form.get('email'),
+                        password: form.get('password'),
+                        includeDemoData: form.get('demo') === 'on',
+                    },
+                });
+                await router.push('/');
+            } catch (requestError) {
+                setError(requestError.message);
+            }
+        });
     }
 
     return (
@@ -66,8 +70,8 @@ export default function SetupPage({ demoPassword }) {
                     </span>
                 </label>
                 <ErrorMessage message={error} />
-                <Button type="submit" variant="primary" className="w-full" disabled={submitting}>
-                    {submitting ? 'Creating…' : 'Create workspace'}
+                <Button type="submit" variant="primary" className="w-full" loading={submitting}>
+                    {submitting ? 'Creating workspace…' : 'Create workspace'}
                 </Button>
             </form>
         </AuthLayout>
